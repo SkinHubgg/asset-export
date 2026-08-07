@@ -807,10 +807,18 @@ const filterFor = (job: Job) => (SAMPLE ? SAMPLE_FILTERS[job.name] : job.filter)
  * 127 is the shell's own convention for "command not found", so callers testing `code !== 0` behave
  * as they always read.
  */
+/**
+ * Named so the piped stdout/stderr survive into the type. `ReturnType<typeof Bun.spawn>` is the
+ * WIDE signature — `stdout` there is `number | ReadableStream | undefined`, because the streams
+ * depend on the options — so annotating with it loses what `{ stdout: 'pipe' }` established and
+ * `new Response(proc.stdout)` stops typechecking.
+ */
+const spawnPiped = (cmd: string[]) => Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe' })
+
 const run = async (cmd: string[], quiet = false) => {
-	let proc: ReturnType<typeof Bun.spawn>
+	let proc: ReturnType<typeof spawnPiped>
 	try {
-		proc = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe' })
+		proc = spawnPiped(cmd)
 	} catch (e) {
 		const err = e instanceof Error ? e.message : String(e)
 		if (!quiet) console.error(err)
@@ -867,18 +875,46 @@ const ensureCli = async () => {
 	step('Building Source2Viewer from VRF master')
 	mkdirSync(TOOLS, { recursive: true })
 
-	if (!existsSync(VRF_SRC)) {
+	/**
+	 * THE GUARD IS "IS THE SOURCE THERE", NOT "DOES THE FOLDER EXIST".
+	 *
+	 * It used to be `!existsSync(VRF_SRC)`, and the folder is created one line BEFORE the unpack —
+	 * so any failure to unpack left an empty `vrf-src/` behind that then satisfied the guard for
+	 * ever. Every later run skipped the download in silence and died further along, in `vrfRoot()`,
+	 * with a message about `--manifest-only` that had nothing to do with it. Reported from Windows
+	 * on 2026-08-08: the run that hit the `unzip` ENOENT poisoned the checkout, and the NEXT run —
+	 * with that bug already fixed — still failed, because the empty folder was all it took.
+	 *
+	 * A half-finished unpack is now cleaned up rather than cached, so a failed run leaves nothing to
+	 * inherit and the retry starts clean.
+	 */
+	if (!findVrfInner()) {
 		ok('downloading VRF master ...')
 		const zip = join(TOOLS, 'vrf-master.zip')
 		const res = await fetch('https://github.com/ValveResourceFormat/ValveResourceFormat/archive/refs/heads/master.zip')
 		if (!res.ok) throw new UserError(`Downloading VRF master failed (HTTP ${res.status}).`)
 		await Bun.write(zip, await res.arrayBuffer())
+		rmSync(VRF_SRC, { recursive: true, force: true })
 		mkdirSync(VRF_SRC, { recursive: true })
-		// `unzip` is not on Windows; bsdtar (shipped as `tar` since Windows 10) reads zips.
+		// `unzip` is not on Windows; bsdtar (shipped as `tar` since Windows 10) reads zips. Both are
+		// attempted because neither is guaranteed: `run` returns 127 for a missing binary rather
+		// than throwing, which is what makes this `||` reachable at all.
 		const unzipped =
 			(await run(['unzip', '-q', '-o', zip, '-d', VRF_SRC], true)).code === 0 ||
 			(await run(['tar', '-xf', zip, '-C', VRF_SRC], true)).code === 0
-		if (!unzipped) throw new UserError(`Could not unpack ${zip}: neither \`unzip\` nor \`tar\` succeeded.`)
+		if (!unzipped || !findVrfInner()) {
+			rmSync(VRF_SRC, { recursive: true, force: true })
+			throw new UserError(
+				[
+					`Could not unpack ${zip}.`,
+					'',
+					'Neither `unzip` nor `tar` produced a ValveResourceFormat folder. `tar` ships with',
+					'Windows 10+ and macOS; on a minimal Linux image install one of them.',
+					'',
+					'The half-unpacked folder has been removed, so re-running is safe.',
+				].join('\n'),
+			)
+		}
 	}
 
 	ok('building CLI (needs the .NET 10 SDK) ...')
@@ -892,10 +928,21 @@ const ensureCli = async () => {
 	return CLI
 }
 
+/** The extracted `ValveResourceFormat-master` folder inside `.tools/vrf-src`, or undefined. */
+const findVrfInner = () =>
+	(existsSync(VRF_SRC) && readdirSync(VRF_SRC).find(d => d.startsWith('ValveResourceFormat'))) || undefined
+
 const vrfRoot = () => {
-	const inner = existsSync(VRF_SRC) && readdirSync(VRF_SRC).find(d => d.startsWith('ValveResourceFormat'))
+	const inner = findVrfInner()
 	if (!inner)
-		throw new UserError(`VRF source not present under ${VRF_SRC} — run once without --manifest-only to fetch it.`)
+		throw new UserError(
+			[
+				`VRF source not present under ${VRF_SRC}.`,
+				'',
+				'It is fetched automatically on any run that needs the decompiler. If you are seeing',
+				'this, an earlier run failed part-way — delete that folder and run again.',
+			].join('\n'),
+		)
 	return join(VRF_SRC, inner)
 }
 
