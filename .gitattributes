@@ -1,0 +1,12 @@
+# run.bat MUST keep CRLF line endings, and this is not a style preference.
+#
+# cmd.exe reads a batch file line by line as it executes it, and a file with bare LF endings breaks
+# in ways that look like logic errors rather than encoding errors: `goto :label` fails to find
+# labels, and multi-line `if ( ... )` blocks mis-parse. The file is authored with CRLF; this stops a
+# clone on a machine with `core.autocrlf=input` from normalising it to LF and shipping a run.bat
+# that fails only on the platform it exists for.
+*.bat text eol=crlf
+
+# Everything else is left to git's defaults on purpose — the repo is authored on macOS and the one
+# file whose line endings are load-bearing is above. In particular the decompiler already writes
+# items_game.txt as CRLF on every platform, and `platform.test.ts` pins the parser against both.

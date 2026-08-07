@@ -1,0 +1,28 @@
+{
+	"name": "cs2-asset-export",
+	"version": "1.0.0",
+	"private": true,
+	"description": "Exports everything a 3D CS2 skin viewer needs out of a local CS2 install, and publishes it to a CDN",
+	"type": "module",
+	"packageManager": "bun@1.2.22",
+	"engines": {
+		"bun": ">=1.2.0"
+	},
+	"scripts": {
+		"discover": "bun run export.ts --discover",
+		"export": "bun run export.ts",
+		"export:sample": "bun run export.ts --sample",
+		"export:manifest": "bun run export.ts --manifest-only",
+		"export:shaders": "bun run export.ts --dump-shaders",
+		"gamedata": "bun run generate-gamedata.ts",
+		"verify": "bun run publish.ts --verify",
+		"test": "bun test"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.2.0"
+	},
+	"dependencies": {
+		"@clack/prompts": "^1.7.0",
+		"playwright": "^1.62.1"
+	}
+}

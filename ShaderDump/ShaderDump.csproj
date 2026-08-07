@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>ShaderDump</AssemblyName>
+    <RootNamespace>ShaderDump</RootNamespace>
+    <!--
+      Path to the ValveResourceFormat checkout that was already built for -BuildCli.
+      Override it on the command line with -p:VrfPath=C:\src\ValveResourceFormat if it lives
+      elsewhere. (Do not write a double hyphen in this comment - XML forbids it inside comments
+      and MSBuild then fails to load the project at all, with an error that does not mention it.)
+    -->
+    <!--
+      export.ts unzips the GitHub master tarball, so the checkout lands one level deeper than the
+      download directory: .tools/vrf-src/ValveResourceFormat-master. Pointing at .tools/vrf-src
+      alone fails with CS0246 "ValveResourceFormat could not be found".
+    -->
+    <VrfPath Condition="'$(VrfPath)' == ''">$(MSBuildThisFileDirectory)..\.tools\vrf-src\ValveResourceFormat-master</VrfPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(VrfPath)\ValveResourceFormat\ValveResourceFormat.csproj" />
+  </ItemGroup>
+
+</Project>

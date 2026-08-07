@@ -1,0 +1,22 @@
+{
+	"compilerOptions": {
+		// DOM is here only for `export-inspect-env.ts`, which evaluates WebGL code inside a headless
+		// browser page and so references `document` and `WebGL2RenderingContext`.
+		// `DOM.AsyncIterable` is not optional: without it lib.dom's `ReadableStream` shadows Bun's and
+		// `for await (… of file.stream())` in publish.ts stops typechecking.
+		"lib": ["ESNext", "DOM", "DOM.Iterable", "DOM.AsyncIterable"],
+		"target": "ESNext",
+		"module": "Preserve",
+		"moduleResolution": "bundler",
+		"types": ["bun"],
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"allowImportingTsExtensions": true,
+		"verbatimModuleSyntax": true,
+		"noUncheckedIndexedAccess": false,
+		"forceConsistentCasingInFileNames": true
+	},
+	"include": ["*.ts"],
+	"exclude": ["out", "out-sample", ".tools", "node_modules"]
+}
