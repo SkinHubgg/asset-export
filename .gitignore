@@ -30,3 +30,10 @@ exceptions.txt
 node_modules/
 .DS_Store
 *.tsbuildinfo
+
+# Credentials. THE REPO IS PUBLIC — an R2 secret committed here is a secret published to the world,
+# and rotating it is the only remedy once it has been pushed. publish.ts reads these from the
+# environment and never prints them; keep them in a file git cannot see.
+.env
+.env.*
+!.env.example
