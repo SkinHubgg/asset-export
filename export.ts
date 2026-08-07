@@ -787,8 +787,35 @@ const filterFor = (job: Job) => (SAMPLE ? SAMPLE_FILTERS[job.name] : job.filter)
 // Shell + filesystem helpers
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * A MISSING EXECUTABLE MUST COME BACK AS AN EXIT CODE, NOT AS A THROW.
+ *
+ * `Bun.spawn` throws `ENOENT` when the binary is not on PATH, and it throws from the CONSTRUCTOR —
+ * so `.exited` is never awaited and `.code` is never reached. Every "try this tool, fall back to
+ * that one" in this file is written as `run(a).code === 0 || run(b).code === 0`, and all of it was
+ * dead: the first call escaped as an unhandled error.
+ *
+ * Reported from Windows 2026-08-08, unpacking the VRF download:
+ *
+ *     error: Executable not found in $PATH: "unzip"
+ *
+ * `unzip` does not exist on Windows. The `tar` fallback one line below is exactly right — bsdtar
+ * ships with Windows 10+ and reads zips — and it never ran. The same bug sat on the `dotnet
+ * --version` probe, where a machine without the SDK would have thrown this instead of printing the
+ * install instructions written for that case.
+ *
+ * 127 is the shell's own convention for "command not found", so callers testing `code !== 0` behave
+ * as they always read.
+ */
 const run = async (cmd: string[], quiet = false) => {
-	const proc = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe' })
+	let proc: ReturnType<typeof Bun.spawn>
+	try {
+		proc = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe' })
+	} catch (e) {
+		const err = e instanceof Error ? e.message : String(e)
+		if (!quiet) console.error(err)
+		return { code: 127, out: '', err }
+	}
 	const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
 	const code = await proc.exited
 	if (!quiet && code !== 0) console.error(err.trim().slice(0, 800))
