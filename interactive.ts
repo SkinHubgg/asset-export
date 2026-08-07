@@ -31,7 +31,7 @@ import { join } from 'node:path'
  *
  * A SIBLING TABLE KEYED BY JOB NAME, which is the shape `SAMPLE_FILTERS` in `export.ts` already
  * uses. `JOBS` is not imported because `export.ts` is a script — importing it runs an export — and
- * because that literal is also read as TEXT by `tools/skin-bench/export-jobs.test.ts`. The cost of a
+ * because that literal is also read as TEXT by `export-jobs.test.ts`. The cost of a
  * sibling table is drift, and `interactive.test.ts` closes it: it extracts the real `JOBS` and fails
  * if the two lists are not identical in both directions.
  *

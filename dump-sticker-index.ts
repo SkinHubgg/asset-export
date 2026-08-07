@@ -1,5 +1,5 @@
 /**
- * Builds the sticker index the viewer renders from.
+ * Builds the sticker index a viewer renders from.
  *
  * The chain the game uses, and therefore the chain this walks:
  *
@@ -13,20 +13,33 @@
  *
  * OUTPUT SHAPE. 11,789 kits x ten texture paths would be ~4 MB of repeated strings, and only ~15
  * distinct textures are shared by nearly every plain sticker. So the file is a string table plus one
- * fixed-length numeric row per kit — about 8x smaller, and the reader is three lines. It is written
- * to apps/web-app/public/ rather than the CDN export root deliberately: nothing here is a Valve
- * TEXTURE, only a listing of paths, and putting it in public/ means the viewer works without a CDN
- * re-upload.
+ * fixed-length numeric row per kit — about 8x smaller, and the reader is three lines.
  *
- *   bun run tools/cs2-export/dump-sticker-index.ts
+ * Nothing in it is a Valve TEXTURE — it is only a listing of paths — so a consumer is free to serve
+ * it from its own origin rather than the CDN, and re-generating it costs no re-upload. It is written
+ * to `<out>/data/sticker-index.json` beside the other generated lists; copy it from there.
+ *
+ *   bun run dump-sticker-index.ts
+ *   bun run dump-sticker-index.ts --out ./out-sample
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { UserError, generatedDataDir } from './platform'
+
+const args = process.argv.slice(2)
+const value = (name: string, env?: string) => {
+	const i = args.indexOf(`--${name}`)
+	if (i >= 0) {
+		const next = args[i + 1]
+		if (!next || next.startsWith('--')) throw new Error(`--${name} needs a value`)
+		return next
+	}
+	return env ? process.env[env] : undefined
+}
 
 const HERE = import.meta.dir
-const OUT = resolve(process.env.CS2_EXPORT_OUT ?? join(HERE, 'out'))
-const WEB_PUBLIC = join(HERE, '..', '..', 'apps', 'web-app', 'public', 'skins')
+const OUT = resolve(value('out', 'CS2_EXPORT_OUT') ?? join(HERE, 'out'))
 
 /* ------------------------------------------------------------------------------------------------
  * Valve KeyValues — the .vmat VRF writes is flat quoted pairs plus one nested block, so this needs
@@ -114,8 +127,8 @@ export const STICKER_TEXTURE_SLOTS = [
 
 /**
  * One kit, as stored: six texture-table indices (-1 = unbound) then the parameters, in this order.
- * Kept as a flat array so the JSON is compact; `apps/web-app/.../stickerIndex.ts` is the only reader
- * and names the columns.
+ * Kept as a flat array so the JSON is compact — the consumer that reads it names the columns, and
+ * `STICKER_TEXTURE_SLOTS` above is the column order it has to agree with.
  */
 export type StickerRow = number[]
 
@@ -216,6 +229,9 @@ const srgbToLinear = (value: number) =>
 	Math.round((value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4) * 1e6) / 1e6
 
 const main = () => {
+	// Before `build()` walks 11,789 kits through the material tree, so a bad `--out` is a one-line
+	// error rather than a wasted pass.
+	const dataDir = generatedDataDir(OUT)
 	const { rows, textures, missingVmat, missingTexture, kitIds } = build()
 	const file: StickerIndexFile = {
 		textures,
@@ -223,8 +239,7 @@ const main = () => {
 		generated: new Date().toISOString(),
 		kitCount: Object.keys(rows).length,
 	}
-	mkdirSync(WEB_PUBLIC, { recursive: true })
-	const target = join(WEB_PUBLIC, 'sticker-index.json')
+	const target = join(dataDir, 'sticker-index.json')
 	writeFileSync(target, JSON.stringify(file))
 	const bytes = readFileSync(target).length
 
@@ -238,4 +253,14 @@ const main = () => {
 	console.log(`wrote ${target} (${(bytes / 1024).toFixed(0)} KB)`)
 }
 
-main()
+// One line for anything the operator can fix, a stack trace for anything they cannot — the same
+// contract `export.ts` and `publish.ts` hold. A wrong `--out` is not a crash.
+try {
+	main()
+} catch (err) {
+	if (err instanceof UserError) {
+		console.error(`\nerror: ${(err as Error).message}`)
+		process.exit(1)
+	}
+	throw err
+}

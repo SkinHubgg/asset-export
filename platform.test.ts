@@ -14,10 +14,11 @@
  */
 
 import { describe, expect, test } from 'bun:test'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, resolve, win32 } from 'node:path'
 import { parseKeyValues } from './generate-gamedata'
-import { cs2GameCandidates, fileNameOf, relSlash, stemOf } from './platform'
+import { UserError, cs2GameCandidates, fileNameOf, generatedDataDir, relSlash, stemOf } from './platform'
 
 /**
  * Resolved HERE rather than imported from `tools/skin-bench/exportOut.ts` on purpose: this directory
@@ -158,6 +159,91 @@ describe('CS2 discovery', () => {
 			// which is how two scripts came to search `Library/Application Support/…` from the cwd.
 			expect(c.startsWith('Library')).toBe(false)
 		}
+	})
+})
+
+/**
+ * WHERE THE FOUR SIDE GENERATORS WRITE — and the reason this needs a test at all.
+ *
+ * `dump-attachments.ts`, `dump-sticker-slots.ts`, `dump-glove-finish.ts` and `dump-sticker-index.ts`
+ * each built their own destination as `resolve(import.meta.dir, '../..')` plus a hard-coded
+ * `apps/web-app/app/profile/[userId]/skins/[UI]/Skin/Modal/SkinPreview/`. That is two levels ABOVE
+ * this folder — a sibling of the checkout, not anything inside it — so it named a directory that
+ * exists in NO clone, the author's included. The four then failed in two different quiet ways: two
+ * `mkdirSync(…, { recursive: true })`'d the missing tree and reported `wrote <path>` into somewhere
+ * nothing reads, and two threw `ENOENT` naming a directory nobody could be expected to create.
+ * Neither shape is a signal, which is how it survived the split into a standalone repository.
+ *
+ * There is deliberately no flag to aim them somewhere else: one destination, `<out>/data/`, off the
+ * same `--out` / `CS2_EXPORT_OUT` every other generated artifact uses. Consumers copy from there.
+ */
+describe('generatedDataDir — the side generators have exactly one destination', () => {
+	const scratch = () => mkdtempSync(join(tmpdir(), 'cs2-generated-'))
+
+	test('it is <out>/data, and it is created inside an export that exists', () => {
+		const out = scratch()
+		try {
+			expect(existsSync(join(out, 'data'))).toBe(false)
+			expect(generatedDataDir(out)).toBe(join(out, 'data'))
+			expect(existsSync(join(out, 'data'))).toBe(true)
+		} finally {
+			rmSync(out, { recursive: true, force: true })
+		}
+	})
+
+	test('an export that already has data/ keeps what is in it — generate-gamedata wrote those', () => {
+		const out = scratch()
+		try {
+			mkdirSync(join(out, 'data'), { recursive: true })
+			Bun.write(join(out, 'data', 'skins.json'), '[]')
+			expect(generatedDataDir(out)).toBe(join(out, 'data'))
+			expect(existsSync(join(out, 'data', 'skins.json'))).toBe(true)
+		} finally {
+			rmSync(out, { recursive: true, force: true })
+		}
+	})
+
+	/**
+	 * THE FAILURE THE OLD CODE DID NOT HAVE. A destination whose parent is missing is a typo'd
+	 * `--out` or an export that was never run — and creating it would put the tables in a brand-new
+	 * empty tree beside the real one, which is the same invisible ending as writing two directories
+	 * up. It has to name the flag, because the flag is the fix.
+	 */
+	test('a missing export root is a UserError that names the override, and creates nothing', () => {
+		const out = join(tmpdir(), `cs2-generated-absent-${Date.now()}`)
+		expect(() => generatedDataDir(out)).toThrow(UserError)
+		try {
+			generatedDataDir(out)
+		} catch (err) {
+			const message = (err as Error).message
+			expect(message).toContain(out)
+			expect(message).toContain('--out')
+			expect(message).toContain('CS2_EXPORT_OUT')
+		}
+		expect(existsSync(out)).toBe(false)
+	})
+
+	/**
+	 * If you are here because this test failed: the answer is not to update the test. Nothing in this
+	 * repository may write outside the directory `--out` resolves to. Asserted against the four
+	 * sources rather than against behaviour because the old bug needed a CS2 install and a decompiler
+	 * to reach at runtime, and a grep needs neither.
+	 */
+	test('no generator reconstructs a path outside this repo', () => {
+		const generators = [
+			'dump-attachments.ts',
+			'dump-sticker-slots.ts',
+			'dump-glove-finish.ts',
+			'dump-sticker-index.ts',
+		]
+		const offenders: string[] = []
+		for (const name of generators) {
+			const src = readFileSync(join(import.meta.dir, name), 'utf8')
+			// `resolve(HERE, '../..')`, `join(HERE, '..', '..', …)`, and the viewer folder by name.
+			for (const pattern of [/'\.\.\/\.\.'/, /'\.\.',\s*\n?\s*'\.\.'/, /SkinPreview/, /apps.web-app/])
+				if (pattern.test(src)) offenders.push(`${name}: ${pattern.source}`)
+		}
+		expect({ escapesTheRepo: offenders }).toEqual({ escapesTheRepo: [] })
 	})
 })
 

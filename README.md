@@ -49,6 +49,7 @@ Everything is overridable, and none of it is pinned to a machine:
 | `--threads <n>` | | CPUs − 2 |
 | `--no-update` | `CS2_EXPORT_NO_UPDATE` | off — every run self-updates first. `--update` forces it in CI |
 | | `CS2_EXPORT_UPDATE_TIMEOUT` | `20000` ms per git call |
+| `--origin <url>` | `SKINS_CDN_ORIGIN` | **no default** — your CDN origin. Required by `publish.ts`; also the host baked into `generate-gamedata.ts`'s image URLs |
 
 ---
 
@@ -106,8 +107,9 @@ bun run export.ts --manifest-only
 
 # 6. Regenerate the seven data/*.json game-data lists. The ONLY thing to run after a CS2 update has
 #    refreshed out/scripts/scripts/items/items_game.txt. Never invokes the exporter, so it can
-#    never delete out/.
-bun run generate-gamedata.ts
+#    never delete out/. Set SKINS_CDN_ORIGIN first: it is baked into every `image` URL these
+#    lists carry, and an unset one bakes in a placeholder host that resolves rather than 404s.
+bun run generate-gamedata.ts --icon-origin https://cdn.example.com
 bun run generate-gamedata.ts --dry-run    # print the coverage report, write nothing
 bun run generate-gamedata.ts --compare    # + diff every list against the community repos
 
@@ -221,30 +223,42 @@ which `csgo_customweapon` is not in any `shaders_vulkan_dir.vpk`), `export-inspe
 Windows**. Everything else in this file was run on macOS as written — including the self-update, which
 was exercised end to end against a scratch clone with a local bare-repo `origin`: it discarded a tracked
 edit, left an untracked file and an ignored `out/` alone, re-exec'd, and the restarted process ran code
-that only existed in the newer commit. **Nothing has been run on Windows** — see *Cross-platform* below.
+that only existed in the newer commit. Windows has now had **one partial run** — enough to find a real
+bug, not enough to call it supported; see *Cross-platform* below.
 
-### The five side generators
+### The side generators — optional, and only if you are building a 3D viewer
 
-Not part of the 40-job export. Each reads `out/` and/or the install and writes one generated table.
+**Not part of the 40-job export, and you can ignore all of them.** They exist because a handful of
+things a 3D viewer needs are *not assets* and so cannot come out of the export at all: an attachment
+point, a sticker's legal region, a glove's tint recipe. Each reads `out/` and/or the install and
+writes one generated table into `out/data/`, beside the export's own data files. Copy what you want
+from there.
+
 They take the same `--cs2` / `CS2_PATH`, `--cli` / `SOURCE2VIEWER_CLI` and `--out` / `CS2_EXPORT_OUT`
-overrides as `export.ts`.
+overrides as `export.ts`, and they write **only** inside `--out`.
 
-| script | produces | notes |
+| script | writes into `out/data/` | notes |
 |---|---|---|
-| `generate-gamedata.ts` | `out/data/*.json` (7 lists + `items_game.json`) | The one to re-run after every CS2 update |
-| `dump-attachments.ts` | the keychain anchor + charm tables | `--only attachments` / `--only keychains`. VRF's glTF exporter drops `AttachmentList`, so these can only come from the decompiled `.vmdl` |
-| `dump-sticker-slots.ts` | per-weapon sticker slot markup | `StickerMarkup` does not survive decompilation; read from the **raw** `.vmdl_c` DATA block |
-| `dump-glove-finish.ts` | the 94 glove finish recipes | |
-| `dump-sticker-index.ts` | `sticker-index.json` | |
-| `extract-weapon-params.ts` | `out/data/weapon-composite-params.json`, `composite-substrate.json` | |
+| `generate-gamedata.ts` | `*.json` (7 lists + `items_game.json`) | The one to re-run after every CS2 update. The only one most people need |
+| `extract-weapon-params.ts` | `weapon-composite-params.json`, `composite-substrate.json` | |
+| `dump-attachments.ts` | `weaponAttachments.data.ts`, `keychainModels.data.ts` | `--only attachments` / `--only keychains`. VRF's glTF exporter drops `AttachmentList`, so these can only come from the decompiled `.vmdl` |
+| `dump-sticker-slots.ts` | `stickerSlots.data.ts` | `StickerMarkup` does not survive decompilation; read from the **raw** `.vmdl_c` DATA block |
+| `dump-glove-finish.ts` | `gloveFinish.data.ts` | The 94 glove finish recipes |
+| `dump-sticker-index.ts` | `sticker-index.json` | sticker id → its textures and parameters, as a string table plus one numeric row per kit |
 
-Four of these currently write into **this repo's** viewer (`apps/web-app/…/SkinPreview/`) rather than
-into `out/`. That path is the one thing here that assumes a repo around it — see *Standalone repo*
-below.
+The four `dump-*` scripts emit **TypeScript source**, not data to fetch — small enough to read, and
+resolvable with no extra runtime request. They are shaped for the viewer this was written for; a
+different viewer will want the same facts in a different shape, and the generator is the part worth
+reading in that case.
+
+> Until 2026-08-08 those four wrote to a hard-coded path **two directories above the repo**
+> (`../../apps/web-app/…`), which exists in no clone — so they silently produced nothing for anyone,
+> the author included. They now have exactly one destination, `<out>/data/`, with no flag to aim them
+> anywhere else.
 
 ### `export-inspect-env.ts` — a one-off, not part of the export
 
-This produced the committed `environment.hdr` and is the only file that uses Playwright. It exports a
+Produces an `environment.hdr` for image-based lighting, and is the only file that uses Playwright. It exports a
 CS2 map's baked environment cubemap to a Radiance `.hdr` equirect, and it uses a headless browser
 **purely as a BC6H texture decoder**: the compressed cube faces are handed to a real WebGL context via
 `EXT_texture_compression_bptc`, drawn to an RGBA32F target and read back as floats. SwiftShader
@@ -269,8 +283,8 @@ out/
     items_game.json          Valve's own item schema, parsed from items_game.txt (6.5 MB)
     agents.json         81   ┐
     collectibles.json  715   │
-    gloves.json         95   │ the SEVEN generated game-data lists — everything the API used to
-    keychains.json     143   │ fetch at runtime from two unmaintained community repos
+    gloves.json         95   │ the SEVEN generated game-data lists — everything commonly
+    keychains.json     143   │ fetched at runtime from two unmaintained community repos
     music.json         101   │
     skins.json        2126   │
     stickers.json    11788   ┘
@@ -290,12 +304,25 @@ Every folder plus `manifest.json` and `data/` goes to the CDN verbatim. Every pa
 
 ## Publishing
 
-`publish.ts`. Read-only checks need no credentials and are always safe; **nothing is ever written
-without `--confirm`.**
+`publish.ts`. Speaks S3, so any S3-compatible bucket works — R2 is what it was written against, and
+`R2_ENDPOINT` + `R2_FORCE_PATH_STYLE=1` retarget it anywhere else. Read-only checks need no
+credentials and are always safe; **nothing is ever written without `--confirm`.**
+
+**`--origin` is required and has no default.** It names *your* public origin. Set it once:
+
+```bash
+export SKINS_CDN_ORIGIN=https://cdn.example.com   # or pass --origin <url> every time
+```
+
+There used to be a default here, and it was the author's own CDN. That is the wrong shape for a tool
+other people run: `--verify` is read-only and therefore the first thing anyone tries, and against an
+origin you do not own it does not fail — it prints a full, authoritative-looking audit of somebody
+else's CDN against your local build. Every line of it is meaningless and none of it says so. It is
+now a one-line error instead.
 
 ```bash
 # safe, read-only, no credentials
-bun run publish.ts --verify                 # audit the live CDN; exits non-zero naming what is stale
+bun run publish.ts --verify                 # audit your CDN; exits non-zero naming what is stale
 bun run publish.ts --verify --quick         # control files + index coverage + a sampled subset
 bun run publish.ts --upload                 # DRY RUN: prints the plan, writes nothing
 bun run publish.ts --upload --prefix data   # dry run, one subtree
@@ -307,10 +334,10 @@ bun run publish.ts --upload --prefix data --confirm    # the seven game-data lis
 bun run publish.ts --upload --since --confirm          # the whole delta since the last publish
 ```
 
-**`data/` must be published BEFORE an API deploy that depends on it.** The API reads those seven
-lists off the CDN; deploying code that expects a new field against a CDN that still serves last
-month's `skins.json` fails silently, because a missing key reads `undefined` rather than throwing.
-The same is true in reverse for `manifest.json` and the viewer.
+**Publish `data/` BEFORE deploying code that depends on it.** Anything reading those seven lists off
+the CDN — an API, a viewer — will not fail loudly against a CDN still serving last month's
+`skins.json`: a missing key reads `undefined` rather than throwing. The same is true in reverse for
+`manifest.json`.
 
 `--verify` exists because **a stale file is a 200.** It checks, in order: the control files
 (`manifest.json`, `data/*.json`) by MD5 against the local build; that the published
@@ -340,17 +367,20 @@ year — including any re-export or model fix — with no way to invalidate shor
 `publish.ts` had the same bug, and it never fired only because nothing had been published to R2 yet.
 `publish.test.ts` pins all three classes.
 
-Objects predating this tooling keep whatever they were given; **see [CDN.md](./CDN.md)** for the
-three Cloudflare-side changes worth making, in priority order.
+Objects your CDN served before this tooling existed keep whatever headers they were given; setting
+these on the PUT only affects new uploads. **See [CDN.md](./CDN.md)** for what the edge in front of
+the bucket has to be told, and for two traps that are not obvious on any CDN.
 
 ### Before your first `--confirm`
 
-1. `--verify` passes, or you know exactly which files it says are stale.
-2. `R2_BUCKET_NAME` names the **assets** bucket. If it names a bucket holding objects but no
+1. `SKINS_CDN_ORIGIN` / `--origin` points at the origin you mean. It is required, so you will not
+   get this far without setting it — but setting it to the *wrong* thing is still possible.
+2. `--verify` passes, or you know exactly which files it says are stale.
+3. `R2_BUCKET_NAME` names the **assets** bucket. If it names a bucket holding objects but no
    `manifest.json`, the publisher refuses rather than pushing 55 GB into somebody else's bucket;
-   `--new-bucket` overrides that for a genuinely fresh one.
-3. The dry run's plan is the size you expect — a delta, not the whole build.
-4. `SKINS_CDN_ORIGIN` points at the origin you mean.
+   `--new-bucket` overrides that for a genuinely fresh one. Worth checking twice if the credentials
+   came from an `.env` you already had.
+4. The dry run's plan is the size you expect — a delta, not the whole build.
 
 As of 2026-08-07 the **write path has never been run against production.** It was developed against a
 local S3 stand-in (`R2_ENDPOINT` + `R2_FORCE_PATH_STYLE=1` retargets it). `--verify` is the only part
@@ -367,7 +397,7 @@ would be slow.
 - **`phases.data.ts` — Doppler phase names.** Black Pearl, Phase 1–4, Emerald, Ruby and Sapphire are
   not in CS2's localization. `csgo_english.txt` carries exactly two Doppler strings,
   `PaintKit_am_marbleized_Tag` → "Doppler" and `PaintKit_am_marbleized_g_Tag` → "Gamma Doppler". The
-  phase is market convention keyed off the paint index. Lose it and every Doppler in the product is
+  phase is market convention keyed off the paint index. Lose it and every Doppler is
   named "Doppler" with no way to tell a Ruby from a Sapphire, and nothing errors.
 - **`rare-pools.data.ts` — the ★ knife/glove case pools.** Which knives and gloves a case can drop is
   *referenced* by `items_game` and never shipped in it (182 dangling loot-list names). Losing one pool
@@ -392,7 +422,9 @@ HTTP verify, and `generate-gamedata.ts --compare`, which is a diagnostic.
 | `--manifest-only needs an existing export at …` | wrong `--out`, or nothing exported yet | check `--out` / `CS2_EXPORT_OUT` |
 | `No kit matched a pattern file` | the `paintmats` / `paintkits` jobs did not run | see `data/link-report.txt`; re-run those jobs |
 | `glTF animation filter matched no animations for: …` | **not an error.** Exit code is 0 and the skeleton is still written — which is the point for `weapon_arms.vmdl_c`, which embeds no clips | nothing |
-| `unreachable … HTTP 403 after 4 attempts` during `--verify` | Cloudflare rate-limited the sweep. **Not** a missing object: R2 answers those 404 | re-run, or `--concurrency 8` |
+| `no CDN origin — pass --origin or set SKINS_CDN_ORIGIN` | deliberate: there is no default origin, because a default would be somebody else's CDN | `export SKINS_CDN_ORIGIN=https://cdn.example.com`, or `--origin <url>` |
+| `Executable not found in $PATH: "unzip"` | fixed 2026-08-08 — `Bun.spawn` threw before the `tar` fallback could run | `bun run export.ts --no-update` will NOT help; pull the fix, or install `unzip` |
+| `unreachable … HTTP 403 after 4 attempts` during `--verify` | the edge rate-limited the sweep (measured on Cloudflare). **Not** a missing object — an object store answers those 404 | re-run, or `--concurrency 8` |
 | `data/… STALE — CDN … vs local …` | the published control file is not the one this build produced | `bun run publish.ts --upload --prefix data --confirm` |
 | `<root>/ 0 entries — root missing from the published index` | the published index predates an exporter change | `--manifest-only` to rebuild, then publish `data/` |
 | `exceptions.txt` full of failures | it is the CLI's log and **appends across runs**, never truncated | delete it before a run for a clean signal. `default_cube_pfm_*` (HDR cubemaps) and `perlin_a_z000` (3D noise) always fail and nothing references them |
@@ -461,9 +493,9 @@ and matching files of the right *extension* does not mean the right folder (`cha
 yields 91 `vmdl_c` that are player bodies, not gloves), so jobs can require a keyword before a
 candidate path is accepted.
 
-In this repo, `tools/skin-bench/export-jobs.test.ts` holds this table to four invariants that fail
-silently if broken: one job per tree, every job has a `--sample` filter, every sample filter is a
-subset of its job's, and the clip names are the right ones.
+`export-jobs.test.ts` holds this table to four invariants that fail silently if broken: one job per
+tree, every job has a `--sample` filter, every sample filter is a subset of its job's, and the clip
+names are the right ones.
 
 ### Where things live in the VPKs
 
@@ -475,7 +507,7 @@ Confirmed against a real install. The surprises are worth knowing before changin
 | pattern textures | `materials/models/weapons/customization/paints/` | 1161 | in style subfolders — and the style prefix does **not** predict the folder (`aa_ancient_brown`, an `anodized_air` kit, points into `hydrographic/`) |
 | per-kit materials | `…/paints/vmats/` | 1076 | named by kit (`aa_fade.vmat_c`). **This is the kit → pattern link** |
 | composite recipes | `weapons/paints/` | 1398 | `vcompmat_c`, `CCompositeMaterialEditorDoc`. Exposes `g_flWearAmount` and `g_nRandomSeed` as external inputs — the two values real float and real seed rendering need |
-| glove models | `agents/models/shared/arms/` | 12 | **not** under any weapons prefix. A glove is an *agent* asset, which is why the viewer had no 3D gloves for as long as it did |
+| glove models | `agents/models/shared/arms/` | 12 | **not** under any weapons prefix. A glove is an *agent* asset, which is why a viewer looking under `weapons/` finds no gloves at all |
 | glove finishes | `gloves/paints/` | 99 | 73 point at `gloves/paints/<kit>.vmat`; the 26 under `volatile_02/` point at `items/assets/paintkits/volatile_02/` + `workshop/paintkits/templates/glove_compositor.vmat` |
 | glove model inputs | `characters/models/shared/arms/glove_` | 105 `vtex_c` + 23 `vmat_c` | a DIFFERENT root from the models: `characters/`, not `agents/` |
 | agent bodies | `agents/models/ctm_` + `tm_` | 35 + 45 | the two prefixes ARE the exclusion mechanism: `agents/models/` matches 92, i.e. these 80 plus the 12 gloves. Neither prefix can reach a folder called `shared` |
@@ -496,13 +528,13 @@ Measured against a real install and turned down. Recorded so nobody re-derives t
 | candidate | size | why not |
 |---|---|---|
 | sticker icons `panorama/images/econ/stickers/` | 22,872 / 4.36 GB | Best coverage anywhere, but two variants per kit and in the newest tournament folders *both* are 512×384 — so the "small" half is the larger one. `-f` cannot exclude a suffix, so taking it means shipping 1.9 GB of redundant variants |
-| case / capsule art | 688 / 122.7 MB | Resolves cleanly and is cheap; nothing in the product lists containers |
+| case / capsule art | 688 / 122.7 MB | Resolves cleanly and is cheap; only worth it if you list containers |
 | collectible pedestals | 1,470 / 464.4 MB | Pins and coins do have models, keyed by `attributes["pedestal display model"]` (with spaces, which is why a naive scan reports zero). Only worth it if pins get a 3D view |
 | patch materials `patches/` | 271 / 37.4 MB | Patches render **on agents**; pays off only once something puts one there |
 | separate `agentmats`/`agenttex` | 1,575 / 1.50 GB | Pure duplication — `--gltf_export_materials` on the agent jobs already writes this tree |
-| the other 29 languages | 155.2 MB | i18n the app has no use for |
-| music-kit audio | 1,579 / 1.71 GB | The product stores a `songId` and never plays anything |
-| tournament art | 643 / 144.1 MB | No consumer |
+| the other 29 languages | 155.2 MB | only `csgo_english.txt` is exported; add a second `localization` job if you need one |
+| music-kit audio | 1,579 / 1.71 GB | `music.json` carries the ids; nothing here plays audio |
+| tournament art | 643 / 144.1 MB | nothing referenced it |
 | third-person clips `animation/anims/world/` | 1,144 | `idle_*` are single frames; the run/walk cycles are 8-directional blends that mean nothing outside the animgraph, which does not export |
 | POV `draw`/`reload`/`shoot` | 642 clips / 95 MB | Need magazine-swap and shell handling before they look like anything |
 
@@ -515,10 +547,15 @@ consumers read metalness/roughness off the packed ORM the way `GLTFLoader` wires
 
 ## Cross-platform
 
-**Proven on macOS. Reasoned, not proven, on Windows and Linux.** Everything below was audited by
-reading and pinned with unit tests that feed Windows-shaped inputs to the platform-sensitive helpers
-(`platform.test.ts`), which is the most that can be done from a Mac. Someone with a Windows box should
-run `--discover`, then `--only compmatdata`, then `--incremental` twice, before trusting a full run.
+**Proven on macOS. Partially exercised on Windows. Reasoned, not proven, on Linux.** Everything below
+was audited by reading and pinned with unit tests that feed Windows-shaped inputs to the
+platform-sensitive helpers (`platform.test.ts`), which is the most that can be done from a Mac.
+
+A first real Windows run happened on **2026-08-08** and found one bug that no amount of reading had
+(`Bun.spawn` throwing rather than returning a code — see the table below). That is the value of the
+exercise, and it is not finished: if you have a Windows box, run `--discover`, then
+`--only compmatdata`, then `--incremental` twice, before trusting a full run, and please report what
+breaks.
 
 ### `run.bat` — **written on macOS, never executed anywhere**
 
@@ -556,9 +593,10 @@ What was actually wrong, and is fixed:
 | `extract-weapon-params.ts` | the same split fed an anchored regex, so `weapon-composite-params.json` was written `{}` |
 | `dump-sticker-slots.ts`, `dump-glove-finish.ts` | CS2 was undiscoverable: `process.env.HOME` (**unset on Windows**), one hardcoded `C:\Program Files (x86)` path, no `libraryfolders.vdf`, no registry, and no `--cs2` flag at all despite the error message advising one |
 | `dump-sticker-slots.ts`, `dump-sticker-index.ts`, `dump-glove-finish.ts` | `dirname(new URL(import.meta.url).pathname)` yields `/C:/…` with a leading slash and `%20` for spaces on Windows. `import.meta.dir` is the portable form |
+| `export.ts`'s `run()` | **found by running it on Windows, 2026-08-08.** `Bun.spawn` throws `ENOENT` from the CONSTRUCTOR when a binary is not on `PATH`, so `.exited` is never awaited and the exit code is never reached. Every `run(a).code === 0 \|\| run(b).code === 0` fallback in the file was therefore dead code. It surfaced as `error: Executable not found in $PATH: "unzip"` — one line above the `tar` fallback that is correct and never ran. `run()` now catches the spawn failure and returns **127**, the shell's own "command not found", so callers testing `code !== 0` behave as they read |
 
-All of it is now one module, `platform.ts`, which `export.ts` already had right and the five smaller
-scripts each had wrong in their own way.
+All of it is now one module, `platform.ts`, which `export.ts` already had right and the smaller
+scripts each had wrong in their own way — plus the `run()` fix above, which is in `export.ts` itself.
 
 **CRLF is not a problem, and this was checked rather than assumed.** The exported `items_game.txt` is
 **already 100% CRLF with zero bare LF** (measured: 272,456 / 0) even on macOS, because the decompiler
@@ -568,36 +606,25 @@ an LF/CRLF equivalence assertion plus a bare-CR negative control, so a future "c
 the apparently-redundant `.trim()` fails loudly instead of on someone's next export.
 
 Also checked and found already correct: no `sh -c`, pipes, backticks, `find`, `xargs` or `rm -rf`
-anywhere; `chmod +x` guarded by platform; `unzip` with a `tar` (bsdtar, Windows 10+) fallback; the
+anywhere; `chmod +x` guarded by platform; `unzip` with a `tar` (bsdtar, Windows 10+) fallback —
+which was true of the *intent* and false of the behaviour until the `run()` fix above, since the
+fallback could not be reached; the
 `.exe` suffix on the CLI; `dotnet` spawned as an argv array. Prompts are `@clack/prompts`, which
 degrades its box-drawing and checkboxes to ASCII when the terminal cannot do Unicode (it checks
 `WT_SESSION`, so Windows Terminal gets the good glyphs and `cmd.exe` the readable fallback) — no raw
 ANSI is written anywhere.
 
-## Standalone repo
+---
 
-This folder imports **nothing** from the repo around it, and no runtime consumer reads `out/` — the API
-and web app read the CDN. It already carries its own `package.json` (two dependencies:
-`@clack/prompts` for the picker, `playwright` for `export-inspect-env.ts`) and its own `tsconfig.json`,
-so `git init` + `bun install` is the whole move. Two things to do at split time:
+## Using the output from your own project
 
-1. **Delete the five `export*` scripts from the parent repo's root `package.json`.** They are
-   duplicated in this folder's own `package.json`, which is what a standalone clone uses.
-2. **Repoint the four side generators.** `dump-attachments.ts`, `dump-sticker-slots.ts`,
-   `dump-glove-finish.ts` and `dump-sticker-index.ts` write into
-   `apps/web-app/app/profile/[userId]/skins/[UI]/Skin/Modal/SkinPreview/` via
-   `resolve(import.meta.dir, '../..')`. That path does not exist in a standalone clone, so those four
-   need a `--target` flag (or to write into `out/data/` and let the consumer copy). They are
-   *generators for one consumer's viewer*, not part of the 40-job export, so either shape is fine —
-   but as written they are the only thing in here that assumes a repo.
+This repo imports nothing from anywhere and depends on no consumer. The contract in both directions
+is one path:
 
-3. **Push the first commit and set an upstream.** The self-update is a deliberate no-op until then —
-   with no commits it skips at `no commits yet — nothing to update from`, which is what a bare
-   `git init` looks like. `git push -u origin main` is what turns it on, and nothing else has to change.
+* **Your build reads the export through `CS2_EXPORT_OUT`**, or through whatever you passed to
+  `--out`. Nothing in here writes outside that directory — a test pins it (`platform.test.ts`).
+* **Every path inside `manifest.json` is origin-relative**, so pointing your app at a CDN is one
+  environment variable on your side. Nothing here needs to know the URL except `publish.ts`.
 
-`tools/skin-bench` (this repo's test suite) finds the export through **`CS2_EXPORT_OUT`**, resolved in
-`tools/skin-bench/exportOut.ts`. That is the whole contract between the two, and it already survives
-the split: point the env var at wherever the exporter is cloned.
-
-Also worth doing on the way out: gitignore `exceptions.txt` and the four `*-log.txt` run logs. They are
-tracked today, they are append-only CLI output, and every export produces a diff in them.
+Upload `out/` verbatim, or copy the parts you use. The four side generators' tables land in
+`out/data/` as ordinary files; copy them into your source tree from there.

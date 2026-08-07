@@ -1,15 +1,20 @@
 #!/usr/bin/env bun
 /**
- * Generate the game-data lists the API used to fetch from `Nereziel/cs2-WeaponPaints` and
- * `ByMykel/CSGO-API` at runtime — stickers, charms, agents, music kits, collectibles and GLOVES —
- * out of files we already export.
+ * Generate the game-data lists commonly fetched at runtime from `Nereziel/cs2-WeaponPaints` and
+ * `ByMykel/CSGO-API` — stickers, charms, agents, music kits, collectibles and GLOVES — out of files
+ * this repo already exports, so nothing has to be downloaded from an unmaintained mirror.
  *
- *   bun run tools/cs2-export/generate-gamedata.ts              # write out/data/*.json
- *   bun run tools/cs2-export/generate-gamedata.ts --compare    # + diff every file against upstream
- *   bun run tools/cs2-export/generate-gamedata.ts --dry-run    # print the report, write nothing
+ *   bun run generate-gamedata.ts              # write out/data/*.json
+ *   bun run generate-gamedata.ts --compare    # + diff every file against upstream
+ *   bun run generate-gamedata.ts --dry-run    # print the report, write nothing
  *
  *   --out <dir>          CS2_EXPORT_OUT      the export to read and write into  (default ./out)
- *   --icon-origin <url>  SKINS_CDN_ORIGIN    host for the `image` URLs          (default cdn.skinhub.gg)
+ *   --icon-origin <url>  SKINS_CDN_ORIGIN    host baked into the `image` URLs   (set this!)
+ *
+ * `--icon-origin` IS WORTH SETTING BEFORE THE FIRST RUN. It is written verbatim into every `image`
+ * field of the generated lists, so leaving it unset bakes a placeholder host into data you then
+ * ship — and because that host is reachable, nothing about the result looks broken. The CLI prints
+ * the origin it used and warns when it is the placeholder.
  *
  * This is safe to re-run at any time and is the ONLY thing to run after a CS2 update refreshes
  * `out/scripts/scripts/items/items_game.txt` — it touches a handful of small files in `out/data/` and
@@ -26,7 +31,7 @@
  * `.json` for the other tools that read it (`export.ts`'s manifest step, `dump-attachments.ts`).
  * See `parseKeyValues` for the two rules that make the parse byte-equivalent to the file we used to
  * fetch — measured 0 differences over all 33 sections, with the comparison's negative controls in
- * `tools/skin-bench/gamedata.test.ts`.
+ * `gamedata.test.ts`.
  *
  * `csgo_english.txt` is UTF-8 with a BOM as the exporter writes it (measured: the first three bytes
  * are EF BB BF), NOT the UTF-16 the VPK holds — the decompiler transcodes it. `readLocalization`
@@ -91,6 +96,18 @@ const value = (name: string, env?: string) => {
 	return env ? process.env[env] : undefined
 }
 
+/**
+ * The placeholder host for `image` URLs when `--icon-origin` / `SKINS_CDN_ORIGIN` is not set.
+ *
+ * It is a PLACEHOLDER and not a default anyone should ship: this string is written verbatim into
+ * every `image` field of `skins.json`, `stickers.json` and the rest, so an unset origin produces
+ * lists that are wrong in the quietest possible way — the URLs resolve, against a host the operator
+ * does not own, and nothing ever looks broken. `main()` warns whenever this value is the one in use.
+ *
+ * Not made mandatory the way `publish.ts`'s `--origin` is, because this writes only local files and
+ * contacts nothing; the cost of getting it wrong is a re-run, not a wrong answer about someone
+ * else's CDN.
+ */
 export const DEFAULT_ICON_ORIGIN = 'https://cdn.skinhub.gg'
 
 // ---------------------------------------------------------------------------------------------
@@ -443,7 +460,8 @@ export type AgentRow = {
  * app's `WEAPON_CATEGORIES` matches gloves by `paint_name.includes(weapon.name)`.
  *
  * `paint` is a STRING on the 94 real rows and the NUMBER 0 on the default row, because that is what
- * upstream ships and `apps/api/data/skins/skins.ts` already types it as `number | string`. Not tidied.
+ * upstream ships. Reproduced rather than tidied, so these lists stay drop-in replacements for the
+ * community ones — the type there is `number | string` too.
  */
 export type GloveRow = {
 	weapon_defindex: number
@@ -1376,8 +1394,16 @@ export const writeItemsGameJson = (outDir: string) => {
 
 const main = async () => {
 	const outDir = value('out', 'CS2_EXPORT_OUT') ?? join(import.meta.dir, 'out')
-	const iconOrigin = value('icon-origin', 'SKINS_CDN_ORIGIN') ?? DEFAULT_ICON_ORIGIN
+	const explicitOrigin = value('icon-origin', 'SKINS_CDN_ORIGIN')
+	const iconOrigin = explicitOrigin ?? DEFAULT_ICON_ORIGIN
 	console.log(`=== Generating game data\n    out    ${outDir}\n    icons  ${iconOrigin}`)
+	// Loud, because the result is not: every `image` URL in the generated lists is built on this
+	// host, and a placeholder one resolves rather than 404s.
+	if (!explicitOrigin)
+		console.warn(
+			`    ! ${iconOrigin} is a PLACEHOLDER and will be baked into every image URL.\n` +
+				'      Pass --icon-origin <url> or set SKINS_CDN_ORIGIN to your own origin.',
+		)
 
 	const data = generateGameData({ out: outDir, iconOrigin })
 	report(data)

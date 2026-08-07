@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
- * Generates the viewer's two keychain tables from CS2's own data.
+ * Generates the two keychain tables a viewer needs from CS2's own data.
  *
- *   bun run tools/cs2-export/dump-attachments.ts
- *   bun run tools/cs2-export/dump-attachments.ts --only attachments   # leave the keychain table alone
+ *   bun run dump-attachments.ts
+ *   bun run dump-attachments.ts --only attachments   # leave the keychain table alone
  *
  * Neither table can come out of `export.ts`, because neither survives the asset export:
  *
@@ -18,18 +18,19 @@
  *     `pedestal_display_model` vmdl path, which is the GLB the `keychains` export job wrote. The
  *     tournament "highlight reel" charms carry no model of their own and inherit one through `base`.
  *
- * Both outputs are committed source, in the same spirit as `weaponModels.ts`: small, reviewable,
- * and resolvable with no extra runtime fetch. Re-run this when Valve ships new charms or retools a
- * weapon.
+ * Both outputs are TypeScript SOURCE rather than fetched data: small, reviewable, and resolvable
+ * with no extra runtime request. They are written to `<out>/data/` like every other generated
+ * artifact; copy them into your viewer from there. Re-run this when Valve ships new charms or
+ * retools a weapon.
  *
  * Requires a local CS2 install and the Source2Viewer CLI that `export.ts` builds — same locations,
- * same overrides (`--cs2` / `CS2_PATH`, `--cli` / `SOURCE2VIEWER_CLI`).
+ * same overrides (`--cs2` / `CS2_PATH`, `--cli` / `SOURCE2VIEWER_CLI`, `--out` / `CS2_EXPORT_OUT`).
  */
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { cliPath, findCs2Pak, relSlash, requireCli, stemOf } from './platform'
+import { UserError, cliPath, findCs2Pak, generatedDataDir, relSlash, requireCli, stemOf } from './platform'
 
 const args = process.argv.slice(2)
 const value = (name: string, env?: string) => {
@@ -58,8 +59,6 @@ const ONLY =
 const writes = (table: 'attachments' | 'keychains') => !ONLY || ONLY.includes(table)
 
 const HERE = import.meta.dir
-const REPO = resolve(HERE, '../..')
-const VIEWER = join(REPO, 'apps/web-app/app/profile/[userId]/skins/[UI]/Skin/Modal/SkinPreview')
 const OUT = resolve(value('out', 'CS2_EXPORT_OUT') ?? join(HERE, 'out'))
 const CLI = cliPath(value('cli', 'SOURCE2VIEWER_CLI'))
 
@@ -587,8 +586,13 @@ const keychainSeedExpressions = (definitions: KeychainDefinitions) => {
 const main = async () => {
 	requireCli(CLI)
 	const pak = cs2Pak()
+	// Resolved BEFORE the decompiler runs. Both tables are written at the very end, after several
+	// minutes of `vmdl_c` extraction, so a typo'd `--out` that is only noticed at the write is a
+	// typo that costs the whole run.
+	const target = generatedDataDir(OUT)
 	console.log(`cli:  ${CLI}`)
 	console.log(`pak:  ${pak}`)
+	console.log(`out:  ${target}`)
 
 	const temp = mkdtempSync(join(tmpdir(), 'cs2-attachments-'))
 	try {
@@ -680,16 +684,18 @@ const main = async () => {
 			`keychain quads: ${totalPatches} total | worst reconstructed-corner skew ${(worstSkew * 100).toFixed(1)}% of quad, on ${worstSkewAt || 'none'}`,
 		)
 
-		const models = readFileSync(join(VIEWER, 'weaponModels.ts'), 'utf8')
-		const weaponPaths = [...models.matchAll(/\bweapon_[a-z0-9_]+: '(models\/[^']+\.glb)'/g)].map(m => m[1])
-		const rows = weaponPaths.filter(path => table.has(path)).sort()
-		const missing = weaponPaths.filter(path => !table.has(path))
-		console.log(`weapons in weaponModels.ts: ${weaponPaths.length}, with attachments: ${rows.length}`)
+		// EVERY weapon that carries an attachment block, not a subset of them. This used to be
+		// intersected with the model paths scraped out of one consumer's `weaponModels.ts` — a file
+		// TWO DIRECTORIES ABOVE this repo, i.e. one that exists in no clone, so the read threw before
+		// anything was written. The table is keyed by the export-relative GLB path and looked up by
+		// it, so rows a given consumer never asks for are inert; a superset costs a few KB and owes
+		// nothing to anyone's directory layout.
+		const rows = [...table.keys()].sort()
+		console.log(`weapons with an attachment block: ${rows.length}`)
 		console.log(`  with keychain: ${rows.filter(p => table.get(p)?.keychain).length}`)
 		console.log(`  with stattrak: ${rows.filter(p => table.get(p)?.stattrak).length}`)
 		console.log(`  with nametag: ${rows.filter(p => table.get(p)?.nametag).length}`)
 		console.log(`  with nametag_legacy: ${rows.filter(p => table.get(p)?.nametag_legacy).length}`)
-		if (missing.length) console.warn(`  ! no attachment block: ${missing.join(', ')}`)
 
 		const vec = (v: [number, number, number]) => `[${v.map(n => Number(n.toFixed(6))).join(', ')}]`
 		const attachment = (a: Attachment | undefined) =>
@@ -725,11 +731,11 @@ const main = async () => {
 			})
 			.join('\n')
 
-		const attachmentsFile = join(VIEWER, 'weaponAttachments.data.ts')
+		const attachmentsFile = join(target, 'weaponAttachments.data.ts')
 		if (writes('attachments'))
 			writeFileSync(
 				attachmentsFile,
-				`// GENERATED by tools/cs2-export/dump-attachments.ts — do not edit by hand.
+				`// GENERATED by dump-attachments.ts — do not edit by hand.
 //
 // Every weapon's \`keychain\` / \`keychain_legacy\` / \`stattrak\` / \`stattrak_legacy\` / \`nametag\` /
 // \`nametag_legacy\` attachment, read
@@ -772,14 +778,14 @@ ${body}
 		console.log(`keychain static adjust: ${staticRows.length} ids carry a live non-neutral .vmat value`)
 		if (silentSeeds.length) console.log(`  seed does NOT change colour for: ${silentSeeds.join(', ')}`)
 		if (missingOverrides.length) console.warn(`  ! keychain_material not exported: ${missingOverrides.join(', ')}`)
-		const keychainFile = join(VIEWER, 'keychainModels.data.ts')
+		const keychainFile = join(target, 'keychainModels.data.ts')
 		const overrideLiteral = ({ color, normal, metalness, ao }: MaterialOverride) =>
 			`{ color: '${color}', normal: ${normal ? `'${normal}'` : 'null'}, metalness: ${
 				metalness ? `'${metalness}'` : 'null'
 			}, ao: ${ao ? `'${ao}'` : 'null'} }`
 		writeFileSync(
 			keychainFile,
-			`// GENERATED by tools/cs2-export/dump-attachments.ts — do not edit by hand.
+			`// GENERATED by dump-attachments.ts — do not edit by hand.
 //
 // keychain id -> the GLB the \`keychains\` export job wrote for its \`pedestal_display_model\`, for
 // every id in items_game's \`keychain_definitions\`. The tournament highlight-reel charms declare no
@@ -888,4 +894,14 @@ ${staticRows
 	}
 }
 
-await main()
+// One line for anything the operator can fix, a stack trace for anything they cannot — the same
+// contract `export.ts` and `publish.ts` hold. A missing CLI or a wrong `--out` is not a crash.
+try {
+	await main()
+} catch (err) {
+	if (err instanceof UserError) {
+		console.error(`\nerror: ${err.message}`)
+		process.exit(1)
+	}
+	throw err
+}

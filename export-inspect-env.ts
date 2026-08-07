@@ -1,13 +1,14 @@
 // Exports a CS2 map's baked environment cubemap to a Radiance .hdr equirect.
 //
-//   bun run tools/cs2-export/export-inspect-env.ts \
+//   bun run export-inspect-env.ts \
 //     "$STEAM/Counter-Strike Global Offensive/game/csgo/maps/ui/icon_generation_basic.vpk" \
-//     apps/web-app/public/environment.hdr 0.8311
+//     environment.hdr 0.8311
 //
-// This is how `apps/web-app/public/environment.hdr` was produced — see the long comment in
-// SkinPreview/Scene.tsx for why that map and not another. Re-run it to reproduce the byte content
-// or to try a different map (`maps/ui/inspect_weapons.vpk`, `inspect_item`, `inspect_gloves`; note
-// `inspect_melee` ships NO cubemap at all, so knives in game reflect the sky, not a baked probe).
+// The output is an environment map for image-based lighting — the probe the game lights its OWN
+// inspect view with, so a renderer using it matches CS2 rather than approximating it.
+// `icon_generation_basic` is the map Valve renders inventory icons in; other maps are worth trying
+// (`maps/ui/inspect_weapons.vpk`, `inspect_item`, `inspect_gloves`), but note that `inspect_melee`
+// ships NO cubemap at all — knives in game reflect the sky, not a baked probe.
 //
 // Two things the older note in README.md got wrong: the cubemaps are NOT undecodable, and
 // `default_cube_pfm_*` was never the asset worth decoding.
@@ -21,8 +22,8 @@
 //    Getting that backwards yields a plausible-looking 4x4 image, so the size assertion is loud.
 //  - `COMPRESSED_MIP_SIZE` (extra type 4) on a cubemap records sizes only; the chain is stored raw.
 //
-// playwright is deliberately not a repo dependency (see tools/skin-bench/README): run this from a
-// scratch dir with `bun add playwright`, or `bunx --bun playwright`.
+// playwright is declared in package.json but the BROWSER is not installed by `bun install`:
+// `bunx playwright install chromium` fetches it, and this is the only file that needs it.
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'

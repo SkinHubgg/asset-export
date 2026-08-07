@@ -31,8 +31,8 @@
  *
  * A CS2 update is one command — export, upload only what changed, then prove the CDN serves it:
  *
- *   bun --env-file=apps/api/.env run export.ts --publish --verify            # dry run
- *   bun --env-file=apps/api/.env run export.ts --publish --confirm --verify  # publishes
+ *   bun --env-file=<your .env> run export.ts --publish --verify            # dry run
+ *   bun --env-file=<your .env> run export.ts --publish --confirm --verify  # publishes
  *
  * Publishing is delegated to publish.ts (which also runs standalone, e.g. `--verify` on its own
  * against the live CDN) and never writes without --confirm. `--all` republishes everything
@@ -1598,7 +1598,7 @@ const selectPatternRef = (refs: string[]) =>
  * `items_game.json` those seven and the manifest are built from. Two things the game files do not
  * contain are checked in beside the generator instead of downloaded — `phases.data.ts` (the Doppler
  * phase names) and `rare-pools.data.ts` (which knives and gloves each case can drop). Both are seeded
- * from the last downloaded copy, both are re-verified by `tools/skin-bench/gamedata.test.ts`, and
+ * from the last downloaded copy, both are re-verified by `gamedata.test.ts`, and
  * neither is fetched at export time or at runtime.
  */
 const DOWNLOADS: Record<string, string> = {}

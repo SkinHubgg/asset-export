@@ -21,7 +21,7 @@
  * codebase has, so the join lives in one tested place.
  */
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { homedir, platform } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
@@ -101,6 +101,43 @@ export const stemOf = (path: string, ext?: string) => {
 	const name = fileNameOf(path)
 	if (!ext) return name.replace(/\.[^.]+$/, '')
 	return name.endsWith(ext) ? name.slice(0, -ext.length) : name
+}
+
+/**
+ * `<out>/data` — where the four side generators write their tables. THE ONLY DESTINATION THEY HAVE.
+ *
+ * THIS EXISTS BECAUSE THEY USED TO WRITE OUTSIDE THE REPOSITORY ENTIRELY. Each of the four built its
+ * own destination as `resolve(import.meta.dir, '../..')` plus
+ * `apps/web-app/app/profile/[userId]/skins/[UI]/Skin/Modal/SkinPreview/` — two levels ABOVE this
+ * folder, i.e. a sibling of the checkout rather than anything in it. From
+ * `…/SkinHub/asset-export` that resolves to `…/SkinHub`, which has no `apps/`; from any other clone
+ * it resolves to whatever happens to sit two directories up. So the tables went nowhere useful **for
+ * everyone, the author included**, and did it in the quietest possible way: two of the four
+ * `mkdirSync(…, { recursive: true })`'d the missing tree first and reported `wrote <path>` on a path
+ * no one reads, and the other two threw an `ENOENT` naming a directory that appears in no clone.
+ * A destination that is never right is indistinguishable from one that is never checked, which is
+ * how it survived the split into a standalone repository unnoticed.
+ *
+ * So there is no flag and no override here. One destination, derived from `--out` / `CS2_EXPORT_OUT`
+ * exactly like every other generated artifact, so a `--sample` export's tables land in
+ * `out-sample/data/` beside its own. Consumers copy out of `out/data/`; keeping the generators
+ * unaware of where they copy it to is the entire point.
+ *
+ * `out` itself must already exist — creating it would put the tables in a brand-new empty tree next
+ * to a typo'd `--out`, which is the failure this replaced.
+ */
+export const generatedDataDir = (out: string) => {
+	if (!existsSync(out))
+		throw new UserError(
+			[
+				`No export at ${out}.`,
+				'Generated tables are written to <out>/data/. Run the export first, or point',
+				'--out / CS2_EXPORT_OUT at an existing export directory.',
+			].join('\n'),
+		)
+	const dir = join(out, 'data')
+	mkdirSync(dir, { recursive: true })
+	return dir
 }
 
 // ---------------------------------------------------------------------------------------------

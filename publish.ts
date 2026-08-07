@@ -1,13 +1,13 @@
 #!/usr/bin/env bun
 /**
- * CS2 export publisher — verify, upload and delta-publish `out/` to the asset CDN.
+ * CS2 export publisher — verify, upload and delta-publish `out/` to an asset CDN.
  *
- * The exporter produces ~51 GB across ~73k files; three sites read them straight off one origin
- * (`next.config.ts` rewrites `/skins-cdn/*` there). Everything below exists because that origin
- * was being maintained by hand, and a hand-maintained origin fails QUIETLY: on 2026-08-03 the
- * published `data/weapontex-index.json` predated the exporter learning to walk the composite and
- * position roots, so every HD-mesh weapon bound the legacy texture tree and `uHasPosition` was
- * false everywhere. Nothing 404'd. Nothing threw. 370 kits just rendered wrong.
+ * The exporter produces ~51 GB across ~73k files, and consumers read them straight off one origin.
+ * Everything below exists because that origin was being maintained by hand, and a hand-maintained
+ * origin fails QUIETLY: on 2026-08-03 the published `data/weapontex-index.json` predated the
+ * exporter learning to walk the composite and position roots, so every HD-mesh weapon bound the
+ * legacy texture tree and `uHasPosition` was false everywhere. Nothing 404'd. Nothing threw. 370
+ * kits just rendered wrong.
  *
  *   bun run publish.ts --verify                    # audit the live CDN, exit non-zero if stale
  *   bun run publish.ts --verify --quick            # control files + coverage + a sampled subset
@@ -17,21 +17,23 @@
  *   bun run publish.ts --upload --since --confirm  # only what changed since the last publish
  *   bun run publish.ts --upload --prefix data      # limit to one subtree
  *
- * Uploading is a dry run unless `--confirm` is passed. This writes to a production CDN that three
- * sites consume; the default must never be "write", and the write itself is an operator's call —
- * `--verify` and the dry run are the parts that are always safe to run, need no credentials, and
- * carry no risk. As of 2026-08-04 the write path has never been run against production: it was
- * developed and tested against a local S3 stand-in (see R2_ENDPOINT).
+ * Uploading is a dry run unless `--confirm` is passed. This writes to a production CDN; the default
+ * must never be "write", and the write itself is an operator's call — `--verify` and the dry run
+ * are the parts that are always safe to run, need no credentials, and carry no risk. As of
+ * 2026-08-04 the write path has never been run against production: it was developed and tested
+ * against a local S3 stand-in (see R2_ENDPOINT).
  *
  *   --out <path>        CS2_EXPORT_OUT     the export to publish        (default ./out)
- *   --origin <url>      SKINS_CDN_ORIGIN   public origin to verify      (default cdn.skinhub.gg)
+ *   --origin <url>      SKINS_CDN_ORIGIN   YOUR public origin           (REQUIRED — no default)
  *   --concurrency <n>                      parallel requests            (default 24 / 8 upload)
  *   --prefix <path>                        limit to one subtree, repeatable via commas
  *
- * Credentials for `--upload` come from the environment and are never printed:
- * R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME. The repo keeps them in
- * apps/api/.env, so `bun --env-file=apps/api/.env run tools/cs2-export/publish.ts …` is the
- * usual invocation.
+ * Credentials for `--upload` come from the environment and are never printed: R2_ACCOUNT_ID,
+ * R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME. `bun --env-file=<your .env> run
+ * publish.ts …` is a convenient way to supply them.
+ *
+ * The S3 API is what this speaks, so any S3-compatible bucket works; R2_ENDPOINT +
+ * R2_FORCE_PATH_STYLE=1 retarget it away from R2.
  */
 
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
@@ -66,7 +68,6 @@ const value = (name: string, env?: string) => {
 }
 
 const HERE = import.meta.dir
-export const DEFAULT_ORIGIN = 'https://cdn.skinhub.gg'
 
 const step = (msg: string) => console.log(`\n=== ${msg}`)
 const ok = (msg: string) => console.log(`    ${msg}`)
@@ -394,8 +395,9 @@ const verifyDeep = async (local: Map<string, LocalFile>, failures: Failure[], or
 
 	// A bucket that holds almost none of the build is not a half-finished upload, it is the wrong
 	// bucket — and saying so once is infinitely more useful than 72,710 identical "missing" lines.
-	// Worth guarding: R2_BUCKET_NAME in apps/api/.env is the API's user-content bucket, so the
-	// obvious way to run this tool aims it somewhere that is not the asset origin at all.
+	// Worth guarding because an existing `.env` very often already defines R2_BUCKET_NAME for some
+	// OTHER bucket, so the obvious way to supply credentials aims this somewhere that is not the
+	// asset origin at all.
 	const present = [...local.keys()].filter(k => objects.has(k)).length
 	if (present < local.size * 0.1) {
 		failures.push({
@@ -404,7 +406,7 @@ const verifyDeep = async (local: Map<string, LocalFile>, failures: Failure[], or
 			detail: `holds ${present} of the build's ${local.size} files — this is not the bucket behind ${origin}`,
 		})
 		bad(`bucket "${bucket.name}" holds ${present}/${local.size} of the build — wrong bucket, not a bad upload`)
-		bad("check R2_BUCKET_NAME (apps/api/.env names the API's user-content bucket, not the asset origin)")
+		bad('check R2_BUCKET_NAME — an .env reused from another project often names a different bucket')
 		return
 	}
 
@@ -552,7 +554,7 @@ export const verify = async ({ out, origin, concurrency = 24, quick = false, dee
 		ok(`${Object.keys(manifest).length} paint kits reference ${references.length} distinct files`)
 	}
 
-	// ---- 4. probe everything the viewer will actually request ---------------------------------
+	// ---- 4. probe everything a consumer will actually request ---------------------------------
 	const glbs = [...local.keys()].filter(k => k.toLowerCase().endsWith('.glb'))
 	let targets = [...new Set([...references, ...indexEntries, ...glbs])].sort()
 	if (quick && targets.length > 300) {
@@ -578,7 +580,7 @@ export const verify = async ({ out, origin, concurrency = 24, quick = false, dee
 	}
 
 	// ---- 6. every file in the build, when credentials allow it --------------------------------
-	// The checks above cover what the viewer LOOKS UP by name. Stickers, keychains and skyboxes
+	// The checks above cover what a consumer LOOKS UP by name. Stickers, keychains and skyboxes
 	// are addressed by convention rather than through the manifest, so only a listing catches a
 	// gap in those.
 	if (deep && local.size) await verifyDeep(local, failures, origin)
@@ -607,17 +609,18 @@ type Bucket = {
  * S3-compatible client for R2. Credentials come from the environment and are never printed —
  * only the NAMES of missing variables are, which is what an operator needs to fix it.
  *
- * Uses @aws-sdk/client-s3 (the same client apps/api/lib/r2 authenticates with) rather than Bun's
- * built-in S3Client, because Bun's `write()` sends no Cache-Control header and cache policy is
- * half the point of publishing through tooling instead of by hand.
+ * Uses @aws-sdk/client-s3 rather than Bun's built-in S3Client, because Bun's `write()` sends no
+ * Cache-Control header and cache policy is half the point of publishing through tooling instead of
+ * by hand. It is an optional peer dependency: only the write path needs it, and `--verify` — the
+ * part anyone can run — is plain HTTP.
  */
 const openBucket = async (): Promise<Bucket> => {
 	const required = ['R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET_NAME'] as const
 	const missing = required.filter(name => !process.env[name])
 	if (missing.length)
 		throw new UserError(
-			`${missing.join(', ')} not set. The repo keeps them in apps/api/.env — run with ` +
-				'`bun --env-file=apps/api/.env run tools/cs2-export/publish.ts …`.',
+			`${missing.join(', ')} not set. Put them in an env file and run with ` +
+				'`bun --env-file=<your .env> run publish.ts …`, or export them into the environment.',
 		)
 
 	let sdk: typeof import('@aws-sdk/client-s3')
@@ -686,10 +689,11 @@ const openBucket = async (): Promise<Bucket> => {
 /**
  * Refuses to publish into a bucket that is not the asset origin.
  *
- * Not hypothetical: R2_BUCKET_NAME in apps/api/.env names the API's user-content bucket, which is
- * exactly what an operator following the credential instructions would end up pointed at — and a
- * confirmed run would then push 51 GB of textures into it. A bucket that already serves this
- * export has a manifest.json; one that has objects but no manifest.json is somebody else's.
+ * Not hypothetical: an `.env` borrowed from an existing project typically already sets
+ * R2_BUCKET_NAME, to that project's own bucket — which is exactly what an operator following the
+ * credential instructions ends up pointed at, and a confirmed run would then push 51 GB of textures
+ * into it. A bucket that already serves this export has a manifest.json; one that has objects but
+ * no manifest.json is somebody else's.
  */
 const assertPublishTarget = async (bucket: Bucket, plan: LocalFile[]) => {
 	if (flag('new-bucket')) return
@@ -698,8 +702,8 @@ const assertPublishTarget = async (bucket: Bucket, plan: LocalFile[]) => {
 	if (!objects.size && plan.some(f => f.rel === 'manifest.json')) return // genuinely a first publish
 	throw new UserError(
 		`bucket "${bucket.name}" holds ${objects.size} object(s) and no manifest.json — it does not look ` +
-			"like the asset origin. R2_BUCKET_NAME in apps/api/.env is the API's user-content bucket, not " +
-			'this one. Set R2_BUCKET_NAME to the assets bucket, or pass --new-bucket if this really is a ' +
+			'like the asset origin. Check that R2_BUCKET_NAME is the assets bucket and not one an .env ' +
+			'reused from another project already pointed at, or pass --new-bucket if this really is a ' +
 			'fresh one.',
 	)
 }
@@ -878,7 +882,37 @@ export const upload = async ({
 // ---------------------------------------------------------------------------------------------
 
 export const resolveOut = () => resolve(value('out', 'CS2_EXPORT_OUT') ?? join(HERE, 'out'))
-export const resolveOrigin = () => (value('origin', 'SKINS_CDN_ORIGIN') ?? DEFAULT_ORIGIN).replace(/\/+$/, '')
+
+/**
+ * THE ORIGIN IS REQUIRED. There is deliberately no default, and it used to be `cdn.skinhub.gg`.
+ *
+ * A default origin is a URL belonging to whoever wrote it, and everything on this page is aimed at
+ * someone else's host the moment they clone this. `--verify` is the sharp end: it is read-only and
+ * always safe to run, so it is the FIRST command anyone tries, and against the wrong origin it does
+ * not fail — it prints a complete, authoritative-looking audit of a CDN the operator does not own,
+ * comparing it against their local build. Every line of that report is meaningless and none of it
+ * says so. `--upload` is protected by `--confirm` and by the bucket check; the read path had
+ * nothing.
+ *
+ * One env var satisfies it for good, so the cost is paid once and the failure mode is a one-line
+ * error instead of a plausible wrong answer.
+ */
+export const resolveOrigin = () => {
+	const origin = value('origin', 'SKINS_CDN_ORIGIN')
+	if (!origin)
+		throw new UserError(
+			[
+				'no CDN origin — pass --origin or set SKINS_CDN_ORIGIN.',
+				'',
+				'  bun run publish.ts --verify --origin https://cdn.example.com',
+				'  SKINS_CDN_ORIGIN=https://cdn.example.com bun run publish.ts --verify',
+				'',
+				'This names the origin YOUR export is published to. There is no default: a wrong one',
+				'makes --verify audit somebody else\'s CDN and report the result as if it were yours.',
+			].join('\n'),
+		)
+	return origin.replace(/\/+$/, '')
+}
 
 const main = async () => {
 	const out = resolveOut()

@@ -7,7 +7,7 @@
 // (M249). Using the placeholder renders a Glock's pattern 2.7x too large and an AK's 1.3x too
 // large, which no paint seed can compensate for.
 //
-//   bun run tools/cs2-export/extract-weapon-params.ts
+//   bun run extract-weapon-params.ts
 import { readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { join, relative, resolve } from 'node:path'
 import { fileNameOf } from './platform'

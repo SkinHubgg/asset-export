@@ -1,6 +1,6 @@
 # The export output. ~56 GB — it is a build product, never committed. A fresh clone re-runs the
 # export; `--incremental` (the decompiler's own --vpk_cache) makes that far cheaper than the first
-# run. The skin viewer's test suite finds this through CS2_EXPORT_OUT.
+# run. Point a consumer's build at it with CS2_EXPORT_OUT; the side generators write into it too.
 out/
 out-sample/
 
