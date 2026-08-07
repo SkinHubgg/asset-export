@@ -60,8 +60,6 @@ import { RARE_SPECIAL_POOLS } from './rare-pools.data'
 
 const EXPORT_ROOT = process.env.CS2_EXPORT_OUT || join(import.meta.dir, 'out')
 const DATA = join(EXPORT_ROOT, 'data')
-/** Committed in the repo as the API's offline fallback — used only so the phase test never skips. */
-const COMMITTED_SKINS = join(import.meta.dir, '..', '..', 'apps', 'api', 'data', 'skins', 'api', 'skins.json')
 
 const readJson = <T>(path: string): T => JSON.parse(readFileSync(path, 'utf8')) as T
 
@@ -92,10 +90,15 @@ const PHASE_INDEXES: Record<string, number[]> = {
 	Emerald: [568, 1119],
 }
 
-/** Prefer the export; fall back to the committed copy so this can never silently skip. */
+/**
+ * The export, or nothing. There used to be a second candidate here — a copy committed in the
+ * consumer's repo, reached with `../../apps/api/…` — added so this test could never silently skip.
+ * It pointed outside this repo, so after the split it always missed and the fallback it provided was
+ * imaginary. Nothing here may reach for a consumer's files; the export is the only source.
+ */
 const skinsSource = () => {
-	for (const path of [join(DATA, 'skins.json'), COMMITTED_SKINS]) if (existsSync(path)) return path
-	return null
+	const path = join(DATA, 'skins.json')
+	return existsSync(path) ? path : null
 }
 
 const phasedRows = (rows: SkinRow[]) => rows.filter(r => typeof r.phase === 'string' && r.phase.length > 0)
