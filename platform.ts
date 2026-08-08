@@ -21,14 +21,22 @@
  * codebase has, so the join lives in one tested place.
  */
 
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir, platform } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
 export const IS_WINDOWS = platform() === 'win32'
 
-/** Thrown for anything the operator can fix. Reported as a message, never a stack trace. */
-export class UserError extends Error {}
+/**
+ * Thrown for anything the operator can fix. Reported as a message, never a stack trace.
+ *
+ * `name` IS SET EXPLICITLY. A subclass of `Error` inherits `name === 'Error'` unless it assigns one,
+ * so every one of these used to log and serialise as `Error: <message>` — indistinguishable in a log
+ * file from the defects this class exists to be distinguished from.
+ */
+export class UserError extends Error {
+	override name = 'UserError'
+}
 
 // ---------------------------------------------------------------------------------------------
 // Interactive mode gate
@@ -159,12 +167,21 @@ export const cliPath = (override?: string, tools?: string) =>
 			),
 	)
 
-/** The message every script should print when the CLI is not where it expects it. */
+/**
+ * The message every script should print when the CLI is not where it expects it.
+ *
+ * A ZERO-BYTE FILE IS NOT A CLI. `dotnet publish` creates the apphost before filling it, so a build
+ * interrupted at the wrong moment leaves an empty binary that `existsSync` is perfectly happy with —
+ * and every later run then dies at the first extraction with the OS's own "not a valid executable".
+ * `export.ts` deletes and rebuilds it; the scripts that only consume it say so here instead.
+ */
 export const requireCli = (cli: string) => {
-	if (existsSync(cli)) return cli
+	if (existsSync(cli) && statSync(cli).size > 0) return cli
 	throw new UserError(
 		[
-			`No Source2Viewer CLI at ${cli}.`,
+			existsSync(cli)
+				? `${cli} is empty — an interrupted build left it behind. Delete it and re-run.`
+				: `No Source2Viewer CLI at ${cli}.`,
 			'Build it once with `bun run export.ts --discover` (needs the .NET 10 SDK), or point',
 			'--cli / SOURCE2VIEWER_CLI at an existing Source2Viewer-CLI binary built from VRF master.',
 		].join('\n'),
@@ -256,3 +273,158 @@ export const findCs2Game = (override?: string) => {
 
 /** The main archive, `<install>/game/csgo/pak01_dir.vpk`. What the four dump scripts read. */
 export const findCs2Pak = (override?: string) => join(findCs2Game(override), 'csgo', 'pak01_dir.vpk')
+
+// ---------------------------------------------------------------------------------------------
+// Artifacts that survive a run — and must not survive a FAILED one
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A JSON object accumulated across runs, or an empty one when what is on disk cannot be trusted.
+ *
+ * THE SAME SHAPE AS THE POISONED `.tools/vrf-src`, in a second place — and it is worth naming the
+ * pattern, because it has now appeared three times in this repo. Something is written, a later run
+ * finds it present, and "present" is taken to mean "complete":
+ *
+ *   1. `.tools/vrf-src` — created before the unpack, so a failed unpack left an empty folder that
+ *      satisfied `!existsSync(VRF_SRC)` for ever. Fixed 2026-08-08.
+ *   2. `data/texture-reflectivity.json` — merged into on every staged run, and read back with a bare
+ *      `JSON.parse(readFileSync(...))`. A run killed part-way through the write (Ctrl-C, a full disk,
+ *      Windows closing the console) leaves TRUNCATED JSON, and every later run then dies with
+ *      `SyntaxError: JSON Parse error: Unexpected EOF` — naming no file, in a function nobody would
+ *      think to look at — until someone deletes it by hand. That is this function.
+ *   3. `Source2Viewer-CLI` — `dotnet publish` creates the apphost before filling it, so an
+ *      interrupted build leaves a zero-byte executable. See `requireCli`.
+ *
+ * The rule each fix applies: check for the ARTIFACT, not for the path; and never inherit something
+ * a failed run left behind. `writeJsonAtomic` closes the other half — a file written through a
+ * temporary and renamed cannot be observed half-written at all.
+ */
+export const readMergeableJson = <T>(
+	dest: string,
+	onProblem: (msg: string) => void = console.warn,
+): Record<string, T> => {
+	if (!existsSync(dest)) return {}
+	try {
+		const parsed = JSON.parse(readFileSync(dest, 'utf8'))
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not a JSON object')
+		return parsed as Record<string, T>
+	} catch (err) {
+		onProblem(`${dest} is unreadable (${(err as Error).message}) — an earlier run died mid-write. Starting it over.`)
+		rmSync(dest, { force: true })
+		return {}
+	}
+}
+
+/** Write via `<dest>.tmp` + rename, so an interrupted run cannot leave a half-written file behind. */
+export const writeJsonAtomic = (dest: string, data: unknown) => {
+	const tmp = `${dest}.tmp`
+	writeFileSync(tmp, JSON.stringify(data))
+	renameSync(tmp, dest)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Credentials — the `.env` beside this file, and which variables it satisfies
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The four variables `publish.ts --upload --confirm` cannot write without.
+ *
+ * DECLARED HERE AND IMPORTED BY BOTH READERS. `publish.ts`'s `openBucket` used to hold its own copy
+ * of this list and the menu would have needed a second one; a menu that reports "you are all set"
+ * from a list that has drifted from the one the uploader actually checks is worse than no report.
+ */
+export const R2_ENV = ['R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET_NAME'] as const
+
+/**
+ * The CDN origin `--verify` audits against. Deliberately NOT a secret and deliberately shown in
+ * full: a wrong origin is the failure mode `resolveOrigin` exists to prevent, and it can only be
+ * spotted by reading it.
+ */
+export const ORIGIN_ENV = 'SKINS_CDN_ORIGIN'
+
+/**
+ * Values that must never reach a log file or the screen. `R2_BUCKET_NAME` is absent on purpose —
+ * it is a name, `publish.ts`'s bucket-mismatch error already prints it, and knowing which bucket
+ * was targeted is most of the diagnosis. `R2_ACCOUNT_ID` IS here even though it is not a password:
+ * it is the hostname half of the endpoint, so it turns up inside SDK error strings, and it names
+ * the account to anyone holding the other two.
+ */
+export const SECRET_ENV = ['R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_ACCOUNT_ID'] as const
+
+/**
+ * A `.env` file, as a plain map. Enough dotenv for a credentials file and no more: `KEY=value`,
+ * `export KEY=value`, `#` comments, and one level of surrounding quotes.
+ *
+ * SPLITS ON `/\r?\n/`. A `.env` saved by Notepad has CRLF line endings, and splitting on `\n`
+ * alone leaves a trailing `\r` on every VALUE — which does not throw anywhere, it just signs an
+ * S3 request with a secret key that has an invisible byte on the end and comes back 403. The same
+ * `\r` shape has already cost this repo one silent-empty-table bug (see `relSlash`).
+ */
+export const parseEnvFile = (text: string): Record<string, string> => {
+	const found: Record<string, string> = {}
+	for (const raw of text.split(/\r?\n/)) {
+		const line = raw.trim()
+		if (!line || line.startsWith('#')) continue
+		const eq = line.indexOf('=')
+		if (eq < 1) continue
+		const key = line.slice(0, eq).trim().replace(/^export\s+/, '')
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+		const value = line.slice(eq + 1).trim()
+		const quoted = value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.at(-1) === value[0]
+		found[key] = quoted ? value.slice(1, -1) : value
+	}
+	return found
+}
+
+/** `<repo>/.env` — the one place credentials go, named in every message about a missing one. */
+export const envFilePath = (here: string) => join(here, '.env')
+
+export const readEnvFile = (path: string): Record<string, string> => {
+	try {
+		return existsSync(path) ? parseEnvFile(readFileSync(path, 'utf8')) : {}
+	} catch {
+		// An unreadable .env is a reason to say "not found", never a reason to take down the menu.
+		return {}
+	}
+}
+
+/** Where a variable's value came from, or `null`. NEVER the value itself. */
+export type EnvSource = 'environment' | '.env' | null
+
+export type CredentialReport = {
+	/** The `.env` path that was consulted, whether or not it exists. */
+	file: string
+	fileExists: boolean
+	/** Per variable: where it is set, or null. The value is never carried. */
+	source: Record<string, EnvSource>
+	/** Names only — exactly what the operator has to add. */
+	missingForUpload: string[]
+	missingForVerify: string[]
+	/** The origin, in full. Not a secret, and unreadable means unverifiable. */
+	origin: string | null
+}
+
+/**
+ * Which credentials are present, for the menu's settings screen and for the message it prints
+ * before refusing to offer an upload.
+ *
+ * REPORTS THE SOURCE, because "it is in .env but this process did not load it" is a different
+ * problem from "it is not set", and the two used to be indistinguishable: Bun auto-loads `.env`
+ * from the CURRENT WORKING DIRECTORY, so the documented `bun --env-file=.env run publish.ts …`
+ * works from the repo root and the identical command run from one folder up silently does not.
+ */
+export const credentialReport = (here: string, env: Record<string, string | undefined> = process.env) => {
+	const file = envFilePath(here)
+	const fromFile = readEnvFile(file)
+	const sourceOf = (name: string): EnvSource => (env[name] ? 'environment' : fromFile[name] ? '.env' : null)
+	const source: Record<string, EnvSource> = {}
+	for (const name of [...R2_ENV, ORIGIN_ENV]) source[name] = sourceOf(name)
+	return {
+		file,
+		fileExists: existsSync(file),
+		source,
+		missingForUpload: R2_ENV.filter(name => !source[name]),
+		missingForVerify: source[ORIGIN_ENV] ? [] : [ORIGIN_ENV],
+		origin: env[ORIGIN_ENV] || fromFile[ORIGIN_ENV] || null,
+	} satisfies CredentialReport
+}

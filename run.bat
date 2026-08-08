@@ -190,9 +190,15 @@ call bun run export.ts %ARGS%
 set "RC=%ERRORLEVEL%"
 
 :finish
+:: The log folder is named BEFORE popd, while %~dp0 is still meaningful, and named at all because a
+:: Windows console buffer is not evidence - it scrolls, it truncates, and the window closes with it.
+:: export.ts appends to logs\ line by line as the run proceeds, so the newest file there describes
+:: this run even if it was killed part-way. That file is what to send with a bug report.
+if not "%RC%"=="0" (
+  echo [run.bat] exited with code %RC%
+  echo [run.bat] A full log of this run is in "%~dp0logs" - newest file. Send that, not a screenshot.
+)
 popd
-:: Reported AND returned: a script sees the code, a human sees the number.
-if not "%RC%"=="0" echo [run.bat] exited with code %RC%
 :: Pause ONLY on failure, and never when asked not to. An unconditional pause would hang a
 :: scheduled task - the same "blocks instead of erroring" trap export.ts guards its picker against.
 :: On success the window closes; on failure the message stays on screen to be read.

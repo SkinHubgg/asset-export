@@ -14,11 +14,21 @@
  */
 
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve, win32 } from 'node:path'
 import { parseKeyValues } from './generate-gamedata'
-import { UserError, cs2GameCandidates, fileNameOf, generatedDataDir, relSlash, stemOf } from './platform'
+import {
+	UserError,
+	cs2GameCandidates,
+	fileNameOf,
+	generatedDataDir,
+	readMergeableJson,
+	relSlash,
+	requireCli,
+	stemOf,
+	writeJsonAtomic,
+} from './platform'
 
 /**
  * Resolved HERE rather than imported from `tools/skin-bench/exportOut.ts` on purpose: this directory
@@ -315,5 +325,107 @@ describe('parseKeyValues line endings', () => {
 		expect(crlf + bareLf).toBeGreaterThan(100_000)
 		expect(Math.min(crlf, bareLf)).toBe(0) // one style throughout, whichever it is
 		expect(crlf).toBeGreaterThan(0) // today: CRLF. Flip this line if a decompiler change makes it LF.
+	})
+})
+
+/**
+ * THE POISONED-ARTIFACT PATTERN, which has now bitten this repo three times in one week.
+ *
+ * Something is written; a later run finds it present; and "present" is taken to mean "complete".
+ *
+ *   1. `.tools/vrf-src` — the folder was created BEFORE the unpack, so a failed unpack left an empty
+ *      one that satisfied `!existsSync(VRF_SRC)` for ever. Every subsequent run skipped the download
+ *      in silence and died somewhere unrelated. Reported from Windows, 2026-08-08.
+ *   2. `data/texture-reflectivity.json` — merged into on every staged run and read back with a bare
+ *      `JSON.parse(readFileSync(…))`. A run killed mid-write leaves truncated JSON and every later
+ *      run throws `SyntaxError` naming no file, in a function nobody would think to look at.
+ *   3. `Source2Viewer-CLI` — `dotnet publish` creates the apphost before filling it, so an
+ *      interrupted build leaves a ZERO-BYTE executable that `existsSync` is perfectly happy with.
+ *
+ * 2 and 3 are pinned below. Each test first shows the artifact in its poisoned state, because a test
+ * that only asserts the recovery would pass against a function that never had a problem to recover
+ * from.
+ */
+describe('a failed run must not leave state a later run inherits', () => {
+	const scratch = () => {
+		const dir = mkdtempSync(join(tmpdir(), 'cs2-poison-'))
+		return dir
+	}
+
+	test('TRUNCATED merge JSON is discarded and deleted, not thrown from', () => {
+		const dir = scratch()
+		try {
+			const dest = join(dir, 'texture-reflectivity.json')
+			// Exactly what a `writeFileSync` interrupted part-way through leaves behind.
+			writeFileSync(dest, '{"a":{"reflectivity":[0.1,0.2,0.3]},"b":{"refle')
+			// The refutation: this is what the old code did, and it is why every later run failed.
+			expect(() => JSON.parse(readFileSync(dest, 'utf8'))).toThrow()
+
+			const said: string[] = []
+			expect(readMergeableJson(dest, m => said.push(m))).toEqual({})
+			expect(said.join('\n')).toContain('an earlier run died mid-write')
+			expect(said.join('\n')).toContain(dest)
+			// And it is GONE, so the next run starts clean rather than re-reading the same rubble.
+			expect(existsSync(dest)).toBe(false)
+		} finally {
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+
+	test('a valid merge file is returned untouched — recovery must not become data loss', () => {
+		const dir = scratch()
+		try {
+			const dest = join(dir, 'ok.json')
+			writeFileSync(dest, JSON.stringify({ a: { format: 'BC7' } }))
+			expect(readMergeableJson(dest)).toEqual({ a: { format: 'BC7' } })
+			expect(existsSync(dest)).toBe(true)
+			// A missing file is simply an empty merge, not a problem.
+			expect(readMergeableJson(join(dir, 'nope.json'))).toEqual({})
+		} finally {
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+
+	test('a JSON ARRAY where an object was expected is rejected too', () => {
+		const dir = scratch()
+		try {
+			const dest = join(dir, 'array.json')
+			writeFileSync(dest, '[1,2,3]')
+			// `JSON.parse` succeeds here, so the parse alone is not the guard — the shape check is.
+			expect(readMergeableJson(dest, () => {})).toEqual({})
+		} finally {
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+
+	test('writeJsonAtomic leaves no .tmp behind, and replaces the previous contents', () => {
+		const dir = scratch()
+		try {
+			const dest = join(dir, 'out.json')
+			writeJsonAtomic(dest, { first: 1 })
+			writeJsonAtomic(dest, { second: 2 })
+			expect(JSON.parse(readFileSync(dest, 'utf8'))).toEqual({ second: 2 })
+			expect(existsSync(`${dest}.tmp`)).toBe(false)
+		} finally {
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+
+	test('a ZERO-BYTE decompiler is not a decompiler — requireCli says so instead of accepting it', () => {
+		const dir = scratch()
+		try {
+			const cli = join(dir, 'Source2Viewer-CLI')
+			writeFileSync(cli, '')
+			// The refutation: the old guard was `existsSync` alone, and it is satisfied right now.
+			expect(existsSync(cli)).toBe(true)
+			expect(() => requireCli(cli)).toThrow(/is empty/)
+			// Non-empty is accepted, so the guard has not just become "always fail".
+			writeFileSync(cli, 'MZ...')
+			expect(requireCli(cli)).toBe(cli)
+			// And a path that is not there at all keeps its own, different message.
+			expect(() => requireCli(join(dir, 'absent'))).toThrow(/No Source2Viewer CLI/)
+		} finally {
+			rmSync(dir, { recursive: true, force: true })
+		}
 	})
 })

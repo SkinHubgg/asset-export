@@ -1430,14 +1430,20 @@ const main = async () => {
 	}
 }
 
+/**
+ * Only when run directly — `export.ts` and the tests import the builders from here, and an import
+ * must not open a log, install handlers or patch `console`. Spawned from the menu, `openRunLog`
+ * finds `CS2_EXPORT_LOG_FILE` already set and appends to the menu's log rather than starting one.
+ */
 if (import.meta.main) {
+	const { installCrashHandlers, openRunLog, reportFatal, teeConsole } = await import('./runlog')
+	const log = openRunLog('generate-gamedata', { here: import.meta.dir })
+	installCrashHandlers(log)
+	teeConsole(log)
 	try {
 		await main()
+		log.close(0)
 	} catch (error) {
-		if (error instanceof UserError) {
-			console.error(`\nx ${error.message}`)
-			process.exit(1)
-		}
-		throw error
+		process.exit(reportFatal(error, log))
 	}
 }

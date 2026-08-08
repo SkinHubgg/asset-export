@@ -55,21 +55,55 @@ Everything is overridable, and none of it is pinned to a machine:
 
 ## Running it
 
-**Run it with no arguments and it asks.** `bun run export.ts` on a terminal opens a picker: presets
-(game data only, check my install, sample, full), a grouped checklist of all 40 jobs with a
-plain-language label for each, a summary of what is about to happen, and a confirm step. It prints the
-equivalent command before it runs anything, so you can paste that into a script instead of coming
-back.
+**Run it with no arguments and it asks. You never need to type a command.** `bun run export.ts` on a
+terminal opens a menu covering everything this repo can do:
+
+| Menu entry | What it is |
+|---|---|
+| **Check my install** | resolves all 40 jobs' filters, extracts nothing. The right first run |
+| **Export assets…** | full, sample, a grouped checklist of all 40 jobs, manifest rebuild, VPK list |
+| **Regenerate the game data…** | the seven `data/*.json` lists — write, dry run, or compare with upstream |
+| **Verify the CDN…** | read-only audit of the origin against your build; standard, quick or deep |
+| **Upload to the CDN…** | dry run first *always*, then an explicit confirm. Narrow it to `data/` or type a prefix |
+| **Where things are** | CS2 path, output folder, whether the decompiler is built, which credentials are set. Read-only |
 
 It used to run a full export instead — hours, ~55 GB, and it deleted the output folder first with no
-warning. The most natural invocation was the most destructive one.
+warning. The most natural invocation was the most destructive one. And everything except exporting
+used to require a memorised command line, the worst of them being the one that publishes:
 
-The picker **never** appears where something might be waiting on it: any argument at all, `CI=true`, an
+```
+bun --env-file=.env run publish.ts --upload --prefix data --confirm
+```
+
+**The menu loads `.env` from this folder itself**, so credentials just work — it passes `--env-file`
+to the publisher for you and you never type that flag. If a variable is missing it says which one, by
+name, and that `.env` here is where it goes. It never prints a value, only whether one is set.
+
+**A failure returns you to the menu**, with the exit code and the path to the log. It does not end the
+session and it does not dump a stack trace.
+
+The menu **never** appears where something might be waiting on it: any argument at all, `CI=true`, an
 explicit `--yes`, or a non-TTY stdin (a pipe, a redirect, cron, CI) all skip it and behave exactly as
 they did before. `--interactive` overrides those heuristics but **not** the terminal requirement — asked
 for on a pipe it errors in one line rather than hanging, which is what it did before that guard existed.
-Under the hood the picker re-execs this script with real flags, so the interactive path and the flag
-path are the same path by construction.
+Under the hood the menu re-execs `export.ts`, `generate-gamedata.ts` or `publish.ts` with real flags,
+so the interactive path and the flag path are the same path by construction — and it prints the
+equivalent command before running it, so you can paste that into a script instead of coming back.
+
+### Every run writes a log
+
+`logs/<timestamp>-<script>-<pid>.log`, appended **line by line as the run proceeds**, so at any instant
+everything that has happened is already on disk: a `SIGKILL`, a Ctrl-C, or Windows closing the console
+still leaves a usable file. The newest 10 are kept, the rest deleted.
+
+It records the resolved command, the platform, the CS2 path, every job's outcome and timing, and on
+failure the whole error with its stack, the job it was in, and **the full stderr of whatever subprocess
+died** — the console truncates that at 800 characters and the cause is usually past it. The path is
+printed prominently whenever a run fails, and by `run.bat` too: send that file, not a screenshot.
+
+`logs/` is gitignored, for the same reason as `.env` — this repo is public and a log carries absolute
+paths and machine details. Secrets are scrubbed by value before anything is written, but that is the
+second line of defence, not the first.
 
 **On Windows there is `run.bat`.** Double-click it, or call it with the same flags. It elevates through
 UAC — needed only so `--incremental` can write its cache into the CS2 install — and `run.bat --no-admin`
@@ -308,6 +342,12 @@ Every folder plus `manifest.json` and `data/` goes to the CDN verbatim. Every pa
 `R2_ENDPOINT` + `R2_FORCE_PATH_STYLE=1` retarget it anywhere else. Read-only checks need no
 credentials and are always safe; **nothing is ever written without `--confirm`.**
 
+**You do not have to type any of this.** `bun run export.ts` → *Verify the CDN…* / *Upload to the
+CDN…* does all of it, loads `.env` for you, runs the dry run first and only then offers the confirm —
+and the menu prints the equivalent command each time, which is where the ones below come from. Put
+the credentials in a `.env` in this folder (it is gitignored); *Where things are* tells you which of
+them are set without printing any value.
+
 **`--origin` is required and has no default.** It names *your* public origin. Set it once:
 
 ```bash
@@ -329,9 +369,10 @@ bun run publish.ts --upload --prefix data   # dry run, one subtree
 ```
 
 ```bash
-# WRITES. Needs R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET_NAME in the env.
-bun run publish.ts --upload --prefix data --confirm    # the seven game-data lists + manifest
-bun run publish.ts --upload --since --confirm          # the whole delta since the last publish
+# WRITES. Needs R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET_NAME. Put them in
+# a .env here and the menu passes it for you; on the command line say so yourself with --env-file.
+bun --env-file=.env run publish.ts --upload --prefix data --confirm  # the game-data lists + manifest
+bun --env-file=.env run publish.ts --upload --since --confirm        # the delta since the last publish
 ```
 
 **Publish `data/` BEFORE deploying code that depends on it.** Anything reading those seven lists off
@@ -413,8 +454,17 @@ HTTP verify, and `generate-gamedata.ts --compare`, which is a diagnostic.
 
 ## Troubleshooting
 
+**Start with the log.** `logs/` holds the newest 10 runs, one file each, written as the run proceeds.
+The failing run's path is printed on screen, and by `run.bat`. It has the full error and stack, the
+job that was running, and the entire stderr of any subprocess that died — which the console truncates
+at 800 characters. Attach it to a bug report.
+
 | symptom | cause | fix |
 |---|---|---|
+| a run died and there is nothing on screen to read | the console scrolled or the window closed | `logs/` — newest file. It is complete up to the instant the process stopped, even under `SIGKILL` |
+| `R2_… not set` from `publish.ts` | the credentials are not in the environment of *that* process | put them in `.env` here and use the menu, or pass `--env-file=.env` yourself. Bun only auto-loads `.env` from the **current working directory** |
+| `<path> is unreadable … an earlier run died mid-write` | a merge file truncated by an interrupted run | nothing — it says so and starts that file over |
+| `<path> is empty — an earlier build was interrupted` | `dotnet publish` left a zero-byte `Source2Viewer-CLI` | nothing — it deletes it and rebuilds |
 | `Could not find a CS2 install (no csgo/pak01_dir.vpk under any Steam library)` | CS2 on a drive Steam does not list, or a non-Steam install | `--cs2 "D:/SteamLibrary/steamapps/common/Counter-Strike Global Offensive"` |
 | `No Source2Viewer CLI at …, and dotnet is not on PATH` | no .NET SDK | install the **.NET 10** SDK, or point `--cli` at a binary built from VRF **master** |
 | `dotnet publish failed for the CLI` | .NET 9 or older | VRF targets `net10.0` |

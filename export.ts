@@ -64,10 +64,32 @@ import {
 	fileNameOf,
 	findCs2Game,
 	interactiveNeedsTty,
+	readMergeableJson,
 	relSlash,
 	shouldPrompt,
+	writeJsonAtomic,
 } from './platform'
+import { currentLog, installCrashHandlers, openRunLog, reportFatal, teeConsole } from './runlog'
 import { runSelfUpdate } from './selfupdate'
+
+// ---------------------------------------------------------------------------------------------
+// The run log — FIRST, before anything that can fail
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Opened above the argument parsing on purpose. `value()` below throws `UserError` for a flag with
+ * no value, and that happens during MODULE EVALUATION — outside the `try` at the bottom of this
+ * file, which only wraps `main()`. Until this line existed, such a failure produced a bun stack on a
+ * console that on Windows then closed, and nothing on disk. `installCrashHandlers` covers the same
+ * window for an uncaught throw or an unawaited rejection.
+ *
+ * The log is appended to line by line as the run proceeds, never buffered: at any instant everything
+ * that has happened is already on disk, so even a `SIGKILL` leaves a usable file. `teeConsole`
+ * mirrors every `step`/`ok`/`warn` into it without touching a single call site.
+ */
+const LOG = openRunLog('export', { here: import.meta.dir })
+installCrashHandlers(LOG)
+teeConsole(LOG)
 
 // ---------------------------------------------------------------------------------------------
 // Arguments
@@ -816,17 +838,23 @@ const filterFor = (job: Job) => (SAMPLE ? SAMPLE_FILTERS[job.name] : job.filter)
 const spawnPiped = (cmd: string[]) => Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe' })
 
 const run = async (cmd: string[], quiet = false) => {
+	const t0 = Date.now()
 	let proc: ReturnType<typeof spawnPiped>
 	try {
 		proc = spawnPiped(cmd)
 	} catch (e) {
 		const err = e instanceof Error ? e.message : String(e)
 		if (!quiet) console.error(err)
+		currentLog().subprocess({ cmd, code: 127, ms: Date.now() - t0, err })
 		return { code: 127, out: '', err }
 	}
 	const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()])
 	const code = await proc.exited
+	// The console gets 800 characters; the log gets all of it. Both Windows failures reported on
+	// 2026-08-08 — the `unzip` ENOENT and the dotnet build that followed it — had their cause past
+	// that boundary, and there was no file to look in.
 	if (!quiet && code !== 0) console.error(err.trim().slice(0, 800))
+	currentLog().subprocess({ cmd, code, ms: Date.now() - t0, out, err })
 	return { code, out, err }
 }
 
@@ -856,8 +884,30 @@ const hasExt = (name: string, ...exts: string[]) => exts.some(e => name.toLowerC
 // Toolchain: build Source2Viewer + ShaderDump from VRF master
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * True when the decompiler is not just present but plausible.
+ *
+ * A THIRD INSTANCE OF THE POISONED-ARTIFACT SHAPE. `existsSync(CLI)` alone accepts a ZERO-BYTE file,
+ * and `dotnet publish` creates the apphost before it fills it — so a build interrupted at the wrong
+ * instant (Ctrl-C, a full disk, the machine sleeping) leaves an empty `Source2Viewer-CLI.exe` that
+ * satisfies the guard for ever. Every later run then skips the build and fails at the first
+ * extraction with the OS's own "not a valid executable", which names nothing and suggests nothing.
+ * Same fix as the `vrf-src` one: check for the artifact, not for the path.
+ */
+const cliUsable = (path: string) => {
+	try {
+		return existsSync(path) && statSync(path).size > 0
+	} catch {
+		return false
+	}
+}
+
 const ensureCli = async () => {
-	if (existsSync(CLI)) return CLI
+	if (cliUsable(CLI)) return CLI
+	if (existsSync(CLI)) {
+		warn(`${CLI} is empty — an earlier build was interrupted. Removing it and building again.`)
+		rmSync(CLI, { force: true })
+	}
 	if (value('cli', 'SOURCE2VIEWER_CLI'))
 		throw new UserError(`No Source2Viewer CLI at "${CLI}" (from --cli / SOURCE2VIEWER_CLI).`)
 	if ((await run(['dotnet', '--version'], true)).code !== 0) {
@@ -2191,7 +2241,7 @@ const writeTextureReflectivity = async (cli: string, jobs: Job[], archiveFor: (j
 	const dest = join(OUT, 'data', REFLECTIVITY_FILE)
 	// Merged, never replaced: a staged run (--only glovetex) must not drop the roots it did not
 	// re-export. A full run wipes OUT first, so there is nothing stale to merge with.
-	const merged: Record<string, TextureFacts> = existsSync(dest) ? JSON.parse(readFileSync(dest, 'utf8')) : {}
+	const merged = readMergeableJson<TextureFacts>(dest, warn)
 	for (const job of wanted) {
 		const filter = filterFor(job) as string
 		// No -o and no -d: this prints the header block and writes nothing. It is not an extraction.
@@ -2202,7 +2252,7 @@ const writeTextureReflectivity = async (cli: string, jobs: Job[], archiveFor: (j
 		if (!facts.size) warn(`${job.name}: no Reflectivity in the dump - the CLI's DATA block format changed.`)
 	}
 	mkdirSync(join(OUT, 'data'), { recursive: true })
-	writeFileSync(dest, JSON.stringify(merged))
+	writeJsonAtomic(dest, merged)
 	ok(`${REFLECTIVITY_FILE} (${Object.keys(merged).length} textures)`)
 }
 
@@ -2451,34 +2501,38 @@ const main = async () => {
 	if (updated !== null) process.exit(updated)
 
 	/**
-	 * THE PICKER, and it is the first thing in `main` for one reason: the CS2 lookup below THROWS
+	 * THE MENU, and it is the first thing in `main` for one reason: the CS2 lookup below THROWS
 	 * when there is no install, and "no install" is precisely the state in which a newcomer most
-	 * needs to be shown what their options are. So the prompt runs first, reports the install as not
-	 * found, and still offers `--list` and `--manifest-only`.
+	 * needs to be shown what their options are. So the menu runs first, reports the install as not
+	 * found, and still offers the things that work without one.
 	 *
 	 * `shouldPrompt` is false for any argument, a non-TTY stdin, `CI=true` and `--yes`, so every
-	 * scripted caller falls straight through. `runPlan` re-execs this file with real flags — see
-	 * `interactive.ts` for why that indirection is the point rather than a wart.
+	 * scripted caller falls straight through. `runInteractive` re-execs this file — and `publish.ts`,
+	 * and `generate-gamedata.ts` — with real flags; see `interactive.ts` for why that indirection is
+	 * the point rather than a wart.
 	 */
 	if (interactiveNeedsTty(args))
 		throw new UserError(
 			[
 				'--interactive needs a terminal, and stdin is not one (a pipe, a redirect, or a CI runner).',
 				'',
-				'Drop --interactive and pass the flags directly — the picker only ever produces these:',
-				'  --discover | --list | --manifest-only | --sample | --only <jobs> | --yes',
+				'Drop --interactive and pass the flags directly — the menu only ever produces these:',
+				'  export.ts            --discover | --list | --manifest-only | --sample | --only <jobs> | --yes',
+				'  generate-gamedata.ts [--dry-run | --compare]',
+				'  publish.ts           --verify [--quick|--deep] | --upload [--prefix <p>] [--confirm]',
 			].join('\n'),
 		)
 	if (shouldPrompt(args)) {
-		const { promptForPlan, runPlan } = await import('./interactive')
+		const { runInteractive } = await import('./interactive')
 		let cs2: string | Error
 		try {
 			cs2 = findCs2()
 		} catch (err) {
 			cs2 = err instanceof Error ? err : new Error(String(err))
 		}
-		const plan = await promptForPlan({ jobNames: JOBS.map(j => j.name), out: OUT, cs2, cli: CLI })
-		process.exit(await runPlan(plan, HERE))
+		const code = await runInteractive({ jobNames: JOBS.map(j => j.name), out: OUT, cs2, cli: CLI, here: HERE })
+		LOG.close(code)
+		process.exit(code)
 	}
 
 	const game = findCs2()
@@ -2504,7 +2558,7 @@ const main = async () => {
 	const manifestOnly = flag('manifest-only')
 	if (manifestOnly && !existsSync(OUT)) throw new UserError(`--manifest-only needs an existing export at ${OUT}`)
 	// --manifest-only reuses whatever is on disk, so it must work on a machine with no toolchain.
-	const cli = manifestOnly && !existsSync(CLI) ? null : await ensureCli()
+	const cli = manifestOnly && !cliUsable(CLI) ? null : await ensureCli()
 
 	// `cli` is only ever null under --manifest-only, which skips extraction entirely.
 	if (cli && !manifestOnly) {
@@ -2519,6 +2573,9 @@ const main = async () => {
 		step(`Exporting ${jobs.length} job(s)${SAMPLE ? ' (sample)' : ''}${incremental ? ' (incremental)' : ''}`)
 		let totalSkipped = 0
 		for (const job of jobs) {
+			// Carried into any failure that happens below, so a crash names the job it happened in
+			// rather than leaving the operator to count `ok` lines in a screenshot.
+			currentLog().context({ job: job.name, archive: archiveFor(job) })
 			const filter = filterFor(job)
 			if (!filter) {
 				warn(`${job.name.padEnd(16)} (no sample - skipped)`)
@@ -2549,6 +2606,7 @@ const main = async () => {
 			totalSkipped += skipped
 			if (!files) warn(`${job.name} produced nothing - re-run with --discover to check its path.`)
 		}
+		currentLog().context({ job: undefined, archive: undefined })
 		if (incremental)
 			ok(
 				totalSkipped
@@ -2595,12 +2653,18 @@ const publishAndVerify = async () => {
 	}
 }
 
+/**
+ * NOTHING ESCAPES, AND NOTHING RETHROWS.
+ *
+ * It used to rethrow anything that was not a `UserError`, which let bun print its own stack — a
+ * fine outcome on a terminal that stays open, and the worst one on Windows, where the whole point of
+ * `run.bat`'s trailing `pause` is that the exit code is non-zero *and reached*. `reportFatal` prints
+ * the message, three frames, and the path of the log holding the rest, then this exits 1 so the
+ * batch file pauses and the operator has something to send.
+ */
 try {
 	await main()
+	LOG.close(0)
 } catch (err) {
-	if (err instanceof UserError) {
-		console.error(`\nerror: ${err.message}`)
-		process.exit(1)
-	}
-	throw err
+	process.exit(reportFatal(err, LOG))
 }

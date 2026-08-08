@@ -39,7 +39,7 @@
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { JUNK_FILES, PUBLISH_STATE_FILE, WEAPONTEX_INDEX_ROOTS, isControlFile, isStableNamedAsset } from './asset-roots'
-import { UserError } from './platform'
+import { R2_ENV, UserError, envFilePath } from './platform'
 
 /**
  * Thrown for anything the operator can fix. Reported as a message, never a stack trace.
@@ -615,12 +615,19 @@ type Bucket = {
  * part anyone can run — is plain HTTP.
  */
 const openBucket = async (): Promise<Bucket> => {
-	const required = ['R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET_NAME'] as const
-	const missing = required.filter(name => !process.env[name])
+	// `R2_ENV` is shared with the menu's credential screen rather than copied here: a menu that
+	// reports "you are all set" from a list that has drifted from the one the uploader checks is
+	// worse than no report at all.
+	const missing = R2_ENV.filter(name => !process.env[name])
 	if (missing.length)
 		throw new UserError(
-			`${missing.join(', ')} not set. Put them in an env file and run with ` +
-				'`bun --env-file=<your .env> run publish.ts …`, or export them into the environment.',
+			[
+				`${missing.join(', ')} not set.`,
+				'',
+				`Put them in ${envFilePath(HERE)} — one KEY=value per line — and either run the menu`,
+				'(`bun run export.ts`, which passes that file for you) or pass it yourself:',
+				'  bun --env-file=.env run publish.ts …',
+			].join('\n'),
 		)
 
 	let sdk: typeof import('@aws-sdk/client-s3')
@@ -941,14 +948,22 @@ const main = async () => {
 	}
 }
 
+/**
+ * Only when run directly. `export.ts` imports `upload`/`verify` from here for its `--publish` and
+ * `--verify` flags, and an import must not open a log, install handlers or patch `console`.
+ *
+ * When the menu spawned this, `CS2_EXPORT_LOG_FILE` is already set and `openRunLog` appends to the
+ * menu's file — so one user action stays one log even though it is two processes.
+ */
 if (import.meta.main) {
+	const { installCrashHandlers, openRunLog, reportFatal, teeConsole } = await import('./runlog')
+	const log = openRunLog('publish', { here: HERE })
+	installCrashHandlers(log)
+	teeConsole(log)
 	try {
 		await main()
+		log.close(0)
 	} catch (err) {
-		if (err instanceof UserError) {
-			console.error(`\nerror: ${err.message}`)
-			process.exit(1)
-		}
-		throw err
+		process.exit(reportFatal(err, log))
 	}
 }

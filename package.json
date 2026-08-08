@@ -9,6 +9,7 @@
 		"bun": ">=1.2.0"
 	},
 	"scripts": {
+		"menu": "bun run export.ts --interactive",
 		"discover": "bun run export.ts --discover",
 		"export": "bun run export.ts",
 		"export:sample": "bun run export.ts --sample",
