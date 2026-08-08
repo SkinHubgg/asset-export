@@ -1658,6 +1658,16 @@ const DOWNLOADS: Record<string, string> = {}
  * and so does `dump-attachments.ts`. It is the same parse `generate-gamedata.ts` performs — imported
  * rather than duplicated, so the two can never drift.
  */
+/**
+ * Can the seven generated lists be built from what is on disk?
+ *
+ * The generator needs `items_game.txt` (the `scripts` job) — without it there is nothing to build
+ * from, and attempting it would throw at the end of an otherwise successful partial export. A pure
+ * predicate so the decision is testable without running an export.
+ */
+export const shouldGenerateGameData = (outDir: string) =>
+	existsSync(join(outDir, 'scripts', 'scripts', 'items', 'items_game.txt'))
+
 const downloadMetadata = async (dataDir: string, allowCached: boolean) => {
 	step('Generating + downloading metadata')
 	mkdirSync(dataDir, { recursive: true })
@@ -2620,6 +2630,35 @@ const main = async () => {
 	await downloadMetadata(join(OUT, 'data'), manifestOnly)
 	await buildManifest(cli, pak)
 	writeWeaponTexIndex()
+
+	/**
+	 * THE SEVEN GENERATED LISTS, so that "export everything" actually exports everything.
+	 *
+	 * Until 2026-08-08 a full export wrote `items_game.json` and nothing else under `data/`: the
+	 * seven lists the API and `@skinhub/cdn` read (skins, stickers, gloves, keychains, music,
+	 * collectibles, agents) existed only if somebody remembered to run `generate-gamedata.ts`
+	 * afterwards. The most complete-sounding option was not complete, and it failed SILENTLY — the
+	 * export looked finished and the consumers 404'd.
+	 *
+	 * Running it here rather than in `downloadMetadata` is deliberate: the generator reads
+	 * `items_game.txt` and the localization tokens that the extraction jobs have just refreshed, so
+	 * it belongs after them, and a run that dies mid-extraction then leaves no half-built lists.
+	 *
+	 * Gated on the inputs actually being present, so `--only <one job>` does not try to regenerate
+	 * from a tree that has none. Problems are reported loudly but do NOT fail the export: the
+	 * extraction succeeded, and `generate-gamedata.ts` is where the detail lives.
+	 */
+	if (shouldGenerateGameData(OUT)) {
+		step('Generating game data')
+		const { generateGameData, writeGameData } = await import('./generate-gamedata')
+		const data = generateGameData({ out: OUT, iconOrigin: value('icon-origin', 'SKINS_CDN_ORIGIN') })
+		for (const line of writeGameData(OUT, data)) ok(line)
+		if (data.problems.length) {
+			warn(`${data.problems.length} problem(s) in the generated data — the game data changed under us:`)
+			for (const problem of data.problems) warn(`  ${problem}`)
+			warn('run `bun run generate-gamedata.ts --compare` for the detail')
+		}
+	} else ok('game data skipped — items_game.txt is not in this export (run the `scripts` job)')
 
 	step('Done')
 	ok(`output: ${OUT}`)

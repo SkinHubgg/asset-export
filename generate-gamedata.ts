@@ -1384,6 +1384,27 @@ const compare = async (data: GameData) => {
  * read it — `export.ts`'s manifest step, `dump-attachments.ts`, and any `--out` run of this script
  * against an export whose `scripts` job predates this change.
  */
+/**
+ * Write `items_game.json` plus the seven generated lists. Extracted so the exporter can call it at
+ * the end of a full run instead of leaving `data/` half-populated.
+ *
+ * WHY THAT MATTERS: a full export writes `items_game.json` and NOTHING else under `data/`, because
+ * the seven lists were only ever produced by running this script by hand. So "export everything"
+ * did not export everything, and the shortfall was silent — you got a finished-looking export
+ * missing exactly the files the API and `@skinhub/cdn` read. Reported by the owner 2026-08-08.
+ *
+ * Returns the log lines rather than printing, so the exporter can render them in its own style.
+ */
+export const writeGameData = (outDir: string, data: GameData) => {
+	const lines = [`data/items_game.json  (${(Bun.file(writeItemsGameJson(outDir)).size / 1024 / 1024).toFixed(1)} MB)`]
+	for (const name of GAMEDATA_FILES) {
+		const dest = join(outDir, 'data', `${name}.json`)
+		writeFileSync(dest, `${JSON.stringify(data[name], null, '\t')}\n`)
+		lines.push(`data/${name}.json  (${(Bun.file(dest).size / 1024).toFixed(0)} KB)`)
+	}
+	return lines
+}
+
 export const writeItemsGameJson = (outDir: string) => {
 	const txt = itemsGameTxtPath(outDir)
 	if (!existsSync(txt)) throw new UserError(`${txt} is missing — export the "scripts" job first`)
@@ -1411,13 +1432,7 @@ const main = async () => {
 	if (flag('dry-run')) console.log('\n=== --dry-run: nothing written')
 	else {
 		console.log('\n=== Writing')
-		const itemsGame = writeItemsGameJson(outDir)
-		console.log(`    data/items_game.json  (${(Bun.file(itemsGame).size / 1024 / 1024).toFixed(1)} MB)`)
-		for (const name of GAMEDATA_FILES) {
-			const dest = join(outDir, 'data', `${name}.json`)
-			writeFileSync(dest, `${JSON.stringify(data[name], null, '\t')}\n`)
-			console.log(`    data/${name}.json  (${(Bun.file(dest).size / 1024).toFixed(0)} KB)`)
-		}
+		for (const line of writeGameData(outDir, data)) console.log(`    ${line}`)
 	}
 
 	if (flag('compare')) await compare(data)
