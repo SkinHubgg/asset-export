@@ -151,3 +151,74 @@ describe('the guard that keeps --incremental off the glTF jobs', () => {
 		expect(src).toContain('const incrementalSafe = (job: Job) => !job.gltf')
 	})
 })
+
+/**
+ * `--sync` — the post-patch update — is `--incremental` plus a publish, so it inherits everything
+ * above and adds three invariants of its own. All three are asserted against the SOURCE, for the
+ * same reason the job list above is: `export.ts` runs an export on import, so it cannot be exercised
+ * in-process. They are here rather than in a menu test because every one of them is about the cache.
+ */
+describe('what --sync adds to the cache, and what it must never take away', () => {
+	const src = readFileSync(join(import.meta.dir, 'export.ts'), 'utf8')
+
+	/**
+	 * THE CACHE HAS NEVER HEARD OF THE OUTPUT FOLDER. Its manifest lives beside the VPK, INSIDE the
+	 * CS2 install, so it outlives `rm -rf out/`, a new `--out`, and a second checkout — and a run
+	 * against an empty output folder would then skip every entry and produce nothing, in silence.
+	 *
+	 * Reproduced on 2026-08-08 rather than imagined: a three-job run that had succeeded once, re-run
+	 * against a freshly deleted output folder, extracted ZERO files and then failed three steps later
+	 * complaining that a job it had just reported as successful had produced no `items_game.txt`.
+	 */
+	test('a job with no prior output cannot skip, however unchanged the game is', () => {
+		expect(src).toContain('const hadOutput = countFiles(target) > 0')
+		expect(src).toContain('const cached = useCache && incrementalSafe(job) && (hadOutput || noManifestYet)')
+	})
+
+	/**
+	 * The escape hatch on that guard, and it is the difference between one full pass and two. A
+	 * manifest that does not exist cannot cause a wrong skip — there is nothing in it to skip against
+	 * — but refusing the cache there also refuses to WRITE it. Measured without this line: a
+	 * first-ever `--sync` extracted everything and recorded nothing, the second extracted everything
+	 * again and recorded it, and only the third was fast.
+	 */
+	test('...but a MISSING manifest is not a reason to refuse the cache, only to populate it', () => {
+		expect(src).toContain('const noManifestYet = !hadManifest.get(archiveFor(job))')
+		// The path is the decompiler's, hardcoded; the test at the top of this file writes to the same
+		// one. If that ever moves, both break together, which is the point of spelling it out twice.
+		expect(src).toContain('hadManifest.set(archive, existsSync(`${archive}.manifest.txt`))')
+	})
+
+	/**
+	 * And the snapshot is taken ONCE, before the loop, because inside it the answer changes underfoot:
+	 * the first cached job creates the manifest, and every job after it then looks like "a manifest
+	 * already exists". Measured from cold on a three-job run — job one populated it, jobs two and
+	 * three were excluded, and warming up took two full passes instead of one.
+	 */
+	test('the manifest snapshot is taken before the loop, not per job', () => {
+		const snapshot = src.indexOf('const hadManifest = new Map<string, boolean>()')
+		const loop = src.indexOf('for (const job of jobs) {', src.indexOf('let totalSkipped = 0'))
+		expect(snapshot).toBeGreaterThan(-1)
+		expect(loop).toBeGreaterThan(snapshot)
+	})
+
+	/**
+	 * WIPING IS THE OPPOSITE OF WHAT AN UPDATE IS FOR, and `--force` is the combination worth pinning:
+	 * it turns the cache off, so without an explicit `!SYNC` the wipe branch would catch
+	 * `--sync --force` and a flag meaning "ignore the cache" would silently also mean "delete 56 GB".
+	 */
+	test('--sync never wipes the output folder, not even with --force', () => {
+		expect(src).toContain('if (!only && !wantsIncremental && !SYNC && existsSync(OUT))')
+	})
+
+	/**
+	 * An unwritable CS2 install (Program Files, no elevation) is a REFUSAL for the flag that asked for
+	 * the cache by name, and a LOUD FALLBACK for the mode that only asked for a current CDN. What
+	 * neither may be is a quiet full extraction.
+	 */
+	test('the unwritable-cache path degrades for --sync and still throws for --incremental', () => {
+		expect(src).toContain('const useCache = wantsIncremental && reportIncremental(jobs, game, SYNC)')
+		expect(src).toContain('if (!degrade)')
+		expect(src).toContain('SO THIS RUN WILL BE A FULL EXTRACTION')
+	})
+})

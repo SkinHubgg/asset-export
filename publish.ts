@@ -765,6 +765,13 @@ export type UploadOptions = {
  * against the previous run's state file, or — if there is none — against the bucket's own ETags.
  * Hashing the whole 51 GB build takes ~80 s on an M-series Mac, which is the price of not
  * re-uploading 51 GB.
+ *
+ * THE RETURN VALUE CARRIES `pending` AND `delta` as well as `uploaded`, because a caller that
+ * summarises this run — `export.ts --sync` — has to distinguish three things a single number cannot:
+ * nothing needed uploading, something does and this was a dry run, and something does but the
+ * comparison was against the whole build rather than a real delta (`delta: false`, which happens
+ * when `--since` had neither a state file nor credentials). Every field was already computed here;
+ * only reporting it is new.
  */
 export const upload = async ({
 	out,
@@ -834,7 +841,7 @@ export const upload = async ({
 
 	if (!plan.length) {
 		ok('nothing to upload')
-		return { uploaded: 0, bytes: 0, skipped: candidates.length }
+		return { uploaded: 0, bytes: 0, skipped: candidates.length, pending: 0, delta: canDelta, dryRun: !confirm }
 	}
 
 	// ---- the plan -----------------------------------------------------------------------------
@@ -860,7 +867,14 @@ export const upload = async ({
 	if (!confirm) {
 		step('DRY RUN — nothing was written')
 		ok("re-run with --confirm to publish this plan. Uploading is yours to run, not the tooling's to decide.")
-		return { uploaded: 0, bytes: totalBytes, skipped: candidates.length - plan.length, dryRun: true }
+		return {
+			uploaded: 0,
+			bytes: totalBytes,
+			skipped: candidates.length - plan.length,
+			pending: plan.length,
+			delta: canDelta,
+			dryRun: true,
+		}
 	}
 
 	// ---- write --------------------------------------------------------------------------------
@@ -901,7 +915,14 @@ export const upload = async ({
 	}
 	writeFileSync(join(out, PUBLISH_STATE_FILE), JSON.stringify(state))
 	ok(`state: ${join(out, PUBLISH_STATE_FILE)} (${Object.keys(state.files).length} files)`)
-	return { uploaded: sent.n, bytes: sent.bytes, skipped: candidates.length - plan.length }
+	return {
+		uploaded: sent.n,
+		bytes: sent.bytes,
+		skipped: candidates.length - plan.length,
+		pending: plan.length,
+		delta: canDelta,
+		dryRun: false,
+	}
 }
 
 // ---------------------------------------------------------------------------------------------

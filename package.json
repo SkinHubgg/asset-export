@@ -10,6 +10,7 @@
 	},
 	"scripts": {
 		"menu": "bun run export.ts --interactive",
+		"sync": "bun run export.ts --sync",
 		"discover": "bun run export.ts --discover",
 		"export": "bun run export.ts",
 		"export:sample": "bun run export.ts --sample",

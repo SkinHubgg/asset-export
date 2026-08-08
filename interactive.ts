@@ -16,6 +16,12 @@
  * never knew it. So every operation the tool can perform is a menu entry: check, export, game data,
  * verify, upload, and a read-only screen that answers "why did that fail" before it has to be asked.
  *
+ * AND THE FIRST ENTRY IS THE ONE PEOPLE ACTUALLY WANT. "Update after a CS2 patch" is the routine
+ * job — the game patched, re-extract what changed, rebuild the lists, push the difference — and
+ * before it existed that routine job was four commands whose ORDER mattered and whose safest member
+ * (`--incremental`) was the least discoverable. It is `syncFlow` below, it is the pre-selected answer
+ * whenever an export already exists, and it is `--sync` on the command line.
+ *
  * HOW IT STAYS HONEST — IT RE-EXECS. The menu never calls into the exporter or the publisher. It
  * resolves a choice into the exact ARGV a person would have typed, prints that command, and spawns
  * the script with those flags. So the interactive path and the flag path are the same path by
@@ -39,10 +45,12 @@
  */
 
 import { confirm, groupMultiselect, intro, isCancel, log, note, outro, select, text } from '@clack/prompts'
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ORIGIN_ENV, R2_ENV, credentialReport, envFilePath } from './platform'
 import { childEnv, currentLog, defaultLogDir } from './runlog'
+import { SYNC_REPORT_ENV, readSyncReport, syncSummaryLines } from './sync'
 
 /**
  * Every job, grouped for the picker and given a plain-language label.
@@ -213,6 +221,51 @@ export const PRESETS: Record<string, Plan> = {
 		heavy: true,
 	},
 }
+
+/**
+ * THE UPDATE — the option this menu exists for, and the one most people will pick most often.
+ *
+ * Not a `PRESETS` entry for two reasons, both of which are properties worth keeping. It is the only
+ * EXPORT plan that needs `.env` (its publish half resolves the origin before it extracts anything),
+ * and `PRESETS` is pinned by a test that says only publish plans do — an exception buried in a table
+ * is worse than a function beside the thing it belongs to. And like the upload flow it is two steps
+ * with a decision in between, which a single argv cannot be.
+ *
+ * `--sync` and not `--update`: `--update` already means "force the exporter's own self-update check",
+ * opposite `--no-update`. See the note on `SYNC` in export.ts.
+ */
+export const syncExportPlan = (): Plan => ({
+	script: 'export',
+	argv: ['--sync'],
+	summary: [
+		'Update after a CS2 patch. Four steps, in order:',
+		'  1. re-extract ONLY the entries whose source bytes the patch changed (never wipes)',
+		'  2. regenerate the seven data/*.json game-data lists',
+		'  3. work out which files that actually changed on the CDN',
+		'  4. print the plan — and stop. Nothing is uploaded by this step.',
+	].join('\n'),
+	needsEnv: true,
+})
+
+/**
+ * The real upload for the update — **or null when the update step did not succeed**, exactly as
+ * `uploadConfirmPlan` is null after a failed dry run, and for exactly the same reason: a step that
+ * exited non-zero has failed to establish what the work IS, and "unknown" is not a thing to answer
+ * yes to. Being a pure function of the exit code, this is provable rather than demonstrable.
+ *
+ * `--since` because a CS2 patch changes megabytes of a 51 GB build, and `--verify` because the point
+ * of the exercise is the origin serving the new files, not a PUT returning 200.
+ */
+export const syncUploadConfirmPlan = (updateExit: number): Plan | null =>
+	updateExit !== 0
+		? null
+		: {
+				script: 'publish',
+				argv: ['--upload', '--since', '--confirm', '--verify'],
+				summary: 'UPLOAD the delta the step above computed, then verify the origin serves it. This writes.',
+				needsEnv: true,
+				writes: true,
+			}
 
 /**
  * The upload pair. Two functions rather than two presets because the prefix is chosen at runtime,
@@ -492,7 +545,7 @@ const announce = async (plan: Plan, ctx: PromptContext, extraWarnings: string[] 
  * printed command literally true rather than approximately true. The child inherits
  * `CS2_EXPORT_LOG_FILE`, so its output lands in the same log as the menu choice that caused it.
  */
-export const runPlan = async (plan: Plan, here: string) => {
+export const runPlan = async (plan: Plan, here: string, extraEnv: Record<string, string> = {}) => {
 	const envFile = plan.needsEnv && existsSync(envFilePath(here)) ? envFilePath(here) : null
 	// `--yes` on the child so it can never prompt again, even for the `full` preset whose argv is
 	// otherwise empty — an empty argv is exactly what `shouldPrompt` treats as "ask me". Only
@@ -517,7 +570,11 @@ export const runPlan = async (plan: Plan, here: string) => {
 		// EXPLICIT, because `Bun.spawn` snapshots the environment at process start and does not see
 		// `process.env` mutations made since — so the log path this process opened would not reach the
 		// child, and one user action would end up split across two log files. See `childEnv`.
-		env: childEnv(),
+		//
+		// `extraEnv` carries the one thing an exit code cannot: the update step's report file. It is
+		// never a substitute for a flag — anything that changes WHAT runs stays in `plan.argv`, so the
+		// printed command remains the whole truth about the run.
+		env: { ...childEnv(), ...extraEnv },
 	})
 	const code = await child.exited
 	currentLog().line(`menu: ${SCRIPT_FILE[plan.script]} exited ${code}`)
@@ -536,6 +593,123 @@ const reportOutcome = (plan: Plan, code: number) => {
 }
 
 /**
+ * The credential gate both writing flows share. Returns false when something is missing, having
+ * already said WHICH — a missing variable should be a sentence naming the variable, not a stack
+ * from inside the S3 client three steps later.
+ */
+const haveCredentials = (ctx: PromptContext) => {
+	const creds = credentialReport(ctx.here)
+	if (!creds.missingForUpload.length && !creds.missingForVerify.length) return true
+	const missing = [...new Set([...creds.missingForUpload, ...creds.missingForVerify])]
+	log.error(
+		[
+			`Not set: ${missing.join(', ')}`,
+			'',
+			`They go in ${creds.file}${creds.fileExists ? '' : ', which does not exist yet'} — one KEY=value per line:`,
+			...missing.map(name => `  ${name}=...`),
+			'',
+			'That file is gitignored. This menu passes it to the publisher for you; you never need',
+			'the --env-file flag yourself.',
+		].join('\n'),
+	)
+	return false
+}
+
+/**
+ * THE UPDATE FLOW — "the game patched, make the CDN current" as one menu entry.
+ *
+ * It is the upload flow's shape, deliberately: a rehearsal that writes nothing, then a decision, then
+ * the one step that writes. What it adds is that the rehearsal DOES REAL WORK — it re-extracts what
+ * the patch changed and rebuilds the game data — so the plan it prints is a plan about this machine's
+ * actual build rather than about the last one.
+ *
+ * AND IT STOPS WHEN THERE IS NOTHING TO DO. That is the whole request: "if there are none, skip". The
+ * confirm step is not merely defaulted to no when the delta is empty, it is not offered, because
+ * being asked "upload for real?" about zero files teaches an operator that the question is noise.
+ * Knowing the delta is empty needs one fact an exit code cannot carry, which is what the report file
+ * in `sync.ts` is for — and a MISSING report is treated as "unknown", never as "nothing", so the
+ * failure mode of that channel is an extra question rather than a silently skipped upload.
+ */
+const syncFlow = async (ctx: PromptContext) => {
+	if (!haveCredentials(ctx)) return
+
+	const plan = syncExportPlan()
+	if (
+		!(await announce(plan, ctx, [
+			'Eight of the forty jobs re-extract in FULL every time whatever the game did — the CRC cache',
+			'cannot see the texture sidecars written beside a GLB. That is ~4.5 GB of the ~55 GB, so an',
+			'update is much faster than a full export but is never instant.',
+			'The cache manifest is written INSIDE the CS2 install. If that folder is not writable (Program',
+			'Files without elevation) this says so and falls back to a full extraction — it does not',
+			'pretend, and it does not stop.',
+			'This step uploads NOTHING. The upload is a separate confirmation afterwards.',
+		]))
+	)
+		return
+
+	// A path only this menu knows, outside the export folder so it can never become part of a build.
+	const reportPath = join(tmpdir(), `cs2-sync-report-${process.pid}-${Date.now()}.json`)
+	let code: number
+	try {
+		code = await runPlan(plan, ctx.here, { [SYNC_REPORT_ENV]: reportPath })
+		reportOutcome(plan, code)
+		if (code !== 0) {
+			log.warn('The update did not finish, so the upload is not offered. Fix the above and run it again.')
+			return
+		}
+
+		const report = readSyncReport(reportPath)
+		if (report) {
+			note(syncSummaryLines(report).join('\n'), 'What changed')
+			// The one state where uploading makes things worse than not uploading: new assets against
+			// last export's lists. Said here rather than only in the child's scrollback, and left as the
+			// operator's call — the confirm below already defaults to no.
+			if (report.gameData === 'failed')
+				log.warn(
+					[
+						'The seven data/*.json lists FAILED to regenerate, so data/ is older than the assets.',
+						'Publishing now ships new assets against stale lists. Run "Regenerate the game data"',
+						'first and read the error, unless you know this upload does not touch data/.',
+					].join('\n'),
+				)
+			if (report.publish?.pending === 0) {
+				log.success('Nothing to upload. The CDN already has everything this build contains.')
+				log.info(
+					[
+						'That is a statement about the last recorded publish, not about the origin itself.',
+						'To ask the origin directly, pick "Verify the CDN".',
+					].join('\n'),
+				)
+				return
+			}
+		} else {
+			log.warn('The update finished but left no summary, so how much there is to upload is unknown.')
+		}
+	} finally {
+		rmSync(reportPath, { force: true })
+	}
+
+	const real = syncUploadConfirmPlan(code)
+	if (!real) {
+		log.warn('The update did not succeed, so the upload is not offered.')
+		return
+	}
+	const creds = credentialReport(ctx.here)
+	log.warn('Everything above this line was a rehearsal. The next step WRITES to the CDN.')
+	if (
+		!(await announce(real, ctx, [
+			`Target origin: ${creds.origin}`,
+			'Only the files listed above are sent — --since re-uploads nothing that has not changed.',
+			'It then verifies the origin actually serves them, and exits non-zero if it does not.',
+		]))
+	) {
+		log.info('Nothing was uploaded.')
+		return
+	}
+	reportOutcome(real, await runPlan(real, ctx.here))
+}
+
+/**
  * The upload flow, which is the only one with a shape of its own.
  *
  * DRY RUN FIRST, ALWAYS, AND WITHOUT ASKING. There is no menu path that reaches `--confirm` without
@@ -544,22 +718,8 @@ const reportOutcome = (plan: Plan, code: number) => {
  * inside the S3 client.
  */
 const uploadFlow = async (ctx: PromptContext) => {
+	if (!haveCredentials(ctx)) return
 	const creds = credentialReport(ctx.here)
-	if (creds.missingForUpload.length || creds.missingForVerify.length) {
-		const missing = [...new Set([...creds.missingForUpload, ...creds.missingForVerify])]
-		log.error(
-			[
-				`Not set: ${missing.join(', ')}`,
-				'',
-				`They go in ${creds.file}${creds.fileExists ? '' : ', which does not exist yet'} — one KEY=value per line:`,
-				...missing.map(name => `  ${name}=...`),
-				'',
-				'That file is gitignored. This menu passes it to the publisher for you; you never need',
-				'the --env-file flag yourself.',
-			].join('\n'),
-		)
-		return
-	}
 
 	const prefixes = await uploadPrefixes()
 	if (prefixes === null) return
@@ -634,8 +794,16 @@ export const runInteractive = async (ctx: PromptContext): Promise<number> => {
 	for (;;) {
 		const choice = await select({
 			message: 'What do you want to do?',
-			initialValue: outExists ? 'gamedata' : 'discover',
+			// The default answer depends on which situation you are in, and there are only two. With an
+			// export already on disk you are here because CS2 patched; with none you are here for the
+			// first time, and the first thing to do is confirm the install.
+			initialValue: outExists ? 'sync' : 'discover',
 			options: [
+				{
+					value: 'sync',
+					label: 'Update after a CS2 patch...',
+					hint: 're-extract only what changed, rebuild the game data, upload only the delta',
+				},
 				{
 					value: 'discover',
 					label: 'Check my install',
@@ -657,6 +825,9 @@ export const runInteractive = async (ctx: PromptContext): Promise<number> => {
 
 		let plan: Choice<Plan> = null
 		switch (choice) {
+			case 'sync':
+				await syncFlow(ctx)
+				continue
 			case 'discover':
 				plan = PRESETS.discover
 				break

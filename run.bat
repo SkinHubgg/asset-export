@@ -6,6 +6,8 @@ setlocal EnableExtensions DisableDelayedExpansion
 :: Double-click it, or call it from a console with the same flags export.ts takes:
 ::
 ::     run.bat
+::     run.bat --sync                 <-- the usual one: update after a CS2 patch
+::     run.bat --sync --confirm       <-- ... and actually publish the delta
 ::     run.bat --discover
 ::     run.bat --only models,weapontex
 ::     run.bat --incremental
@@ -25,6 +27,10 @@ setlocal EnableExtensions DisableDelayedExpansion
 :: the decompiler; there is no flag to move it, and Program Files is not user-writable. export.ts
 :: probes the directory up front and refuses with a clear message rather than dying mid-export, so
 :: without elevation --incremental simply cannot run on a default Windows install.
+::
+:: --sync USES THE SAME CACHE, and it is the flag most people will type, so this matters more now
+:: than it did. Unelevated it does not refuse - it says so in full and falls back to a complete
+:: extraction, which is correct but slow. Elevating is what makes an update take minutes.
 ::
 :: WHAT DOES *NOT* NEED ADMIN, because a tool that demands it needlessly teaches people to click
 :: through UAC prompts without reading them: everything else. --discover, --list, --manifest-only,

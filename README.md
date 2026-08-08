@@ -60,6 +60,7 @@ terminal opens a menu covering everything this repo can do:
 
 | Menu entry | What it is |
 |---|---|
+| **Update after a CS2 patch…** | the routine job, as one option — see *Updating after a CS2 patch* below. Pre-selected whenever an export already exists |
 | **Check my install** | resolves all 40 jobs' filters, extracts nothing. The right first run |
 | **Export assets…** | full, sample, a grouped checklist of all 40 jobs, manifest rebuild, VPK list |
 | **Regenerate the game data…** | the seven `data/*.json` lists — write, dry run, or compare with upstream |
@@ -130,6 +131,11 @@ bun run export.ts --sample
 #    `bun run export.ts` is the picker.
 bun run export.ts --yes
 
+# 3b. AFTER A CS2 PATCH, this is the one — see "Updating after a CS2 patch" below. Re-extracts only
+#     what changed, rebuilds the game data, and publishes only the delta. Never wipes, and never
+#     uploads without --confirm.
+bun --env-file=.env run export.ts --sync
+
 # 4. One stage at a time. Does NOT wipe the output folder, so it is safe against a full export.
 bun run export.ts --only models,weapontex
 bun run export.ts --only scripts,localization        # names from the Jobs table below
@@ -139,10 +145,12 @@ bun run export.ts --only scripts,localization        # names from the Jobs table
 #    iterate on recipe parsing. Add --sample to target out-sample/.
 bun run export.ts --manifest-only
 
-# 6. Regenerate the seven data/*.json game-data lists. The ONLY thing to run after a CS2 update has
-#    refreshed out/scripts/scripts/items/items_game.txt. Never invokes the exporter, so it can
-#    never delete out/. Set SKINS_CDN_ORIGIN first: it is baked into every `image` URL these
-#    lists carry, and an unset one bakes in a placeholder host that resolves rather than 404s.
+# 6. Regenerate the seven data/*.json game-data lists on their own. A full export and `--sync` both
+#    do this for you; run it directly to iterate on the generator, or after a CS2 update has
+#    refreshed out/scripts/scripts/items/items_game.txt without a re-export. Never invokes the
+#    exporter, so it can never delete out/. Set SKINS_CDN_ORIGIN first: it is baked into every
+#    `image` URL these lists carry, and an unset one bakes in a placeholder host that resolves
+#    rather than 404s.
 bun run generate-gamedata.ts --icon-origin https://cdn.example.com
 bun run generate-gamedata.ts --dry-run    # print the coverage report, write nothing
 bun run generate-gamedata.ts --compare    # + diff every list against the community repos
@@ -201,6 +209,61 @@ including both directions of the destructive question: a modified tracked file *
 untracked file, an ignored file and an ignored `out/data/manifest.json` **are still there afterwards**.
 The exception above was found by testing rather than by reading, which is the reason to test it.
 
+### Updating after a CS2 patch — `--sync`
+
+**This is the routine job, and it is one option.** CS2 patched, or a handful of files are missing from
+the CDN: you do not want to re-export 56 GB and re-upload it, you want the difference. Pick
+**Update after a CS2 patch…** in the menu — it is pre-selected once an export exists — or:
+
+```bash
+bun --env-file=.env run export.ts --sync            # dry run: nothing leaves this machine
+bun --env-file=.env run export.ts --sync --confirm  # publish the delta, then verify the origin
+bun run sync                                        # the same, .env auto-loaded from this folder
+```
+
+It is four existing things in order, and none of them is new machinery:
+
+1. **Re-extract only what the game changed** — `--incremental` below. It never wipes the output folder.
+2. **Regenerate the seven `data/*.json` lists**, which is what a CS2 patch actually changes most often.
+3. **Work out what that changed on the CDN** — `publish.ts --upload --since`, a delta against
+   `out/.publish-state.json` (or the bucket's own ETags). Uploading still needs `--confirm`.
+4. **Verify** the origin really serves what was just published.
+
+**If nothing changed it says so and stops**, in one line rather than forty skipped-job lines:
+
+```
+=== Update summary
+    extracted     0 entries re-extracted, 61,204 unchanged and skipped (across 32 CRC-cached jobs)
+    always full   8 glTF jobs re-ran in full regardless — their texture sidecars are not CRC-tracked
+    game data     the seven data/*.json lists were regenerated from this export
+    uploaded      0 files — the delta was empty
+
+    Nothing changed. The game is unchanged since the last export and nothing has changed since the
+    last publish — there is nothing to do.
+```
+
+Four things it is deliberately careful about, because a convenient option that overstates what it did
+is worse than four commands:
+
+- **It is never "fully" incremental.** Eight of the forty jobs re-extract every time whatever the game
+  did (the reason is under `--incremental` below), ~4.5 GB of ~55 GB. The summary always says so.
+- **"Nothing to extract" and "nothing to upload" are different questions.** The publish step runs even
+  when the extraction changed nothing — that is exactly the shape of a previous publish that died
+  half-way, and the summary reports it as *"the game is unchanged, but N files are not on the CDN"*.
+- **A delta of zero is a claim about the last publish, not about the origin.** Only `--verify` speaks
+  for the CDN itself, and the wording never pretends otherwise.
+- **If the CRC cache cannot be written** — `C:\Program Files (x86)` without elevation — it says so in
+  full and falls back to a complete extraction rather than quietly doing one. `run.bat` elevates for
+  exactly this; on Windows that is the difference between an update taking minutes and taking hours.
+
+In the menu the upload is a **separate, second confirmation**: the update step above uploads nothing,
+prints the plan, and the confirm is unreachable if it failed (`syncUploadConfirmPlan` returns `null`,
+pinned by `interactive.test.ts`). And when the delta is empty the confirm is not offered at all — being
+asked "upload for real?" about zero files is how a question becomes noise.
+
+`--sync` is not `--update`: that flag already means *force the exporter's own self-update check*, the
+pair of `--no-update`.
+
 ### `--incremental` — re-extract only what the game changed
 
 ```bash
@@ -224,11 +287,18 @@ silently keep outputs from the old decompiler — invisible, where a slow export
 Two things about it are not what you would assume, and neither is discoverable:
 
 - **The manifest is written next to the VPK, i.e. inside your CS2 install** (`<archive>.manifest.txt`).
-  The path is hardcoded in the decompiler; there is no flag to move it. `--incremental` probes that
-  directory for writability first and refuses with a clear message rather than crashing mid-export —
-  which matters on Windows, where CS2 under `C:\Program Files (x86)` is not user-writable. Steam's
-  *verify integrity of game files* deletes the manifest; that is harmless, the next run is just a full
-  one.
+  The path is hardcoded in the decompiler; there is no flag to move it. Both modes probe that directory
+  for writability first rather than crashing mid-export — which matters on Windows, where CS2 under
+  `C:\Program Files (x86)` is not user-writable. `--incremental` **refuses**, because you asked for the
+  cache by name; `--sync` says so in full and **falls back to a complete extraction**, because you
+  asked for a current CDN and that still delivers one. Steam's *verify integrity of game files* deletes
+  the manifest; that is harmless, the next run is just a full one.
+- **The cache has never heard of your output folder.** It lives in the game install, so it survives
+  deleting `out/`, pointing `--out` somewhere new, or a second checkout — and a run against an empty
+  output folder would otherwise skip every entry and produce nothing at all, silently. So a job with no
+  prior output never skips, whatever the cache says; the summary reports those as
+  `N jobs had no output to be a cache of`. It cannot repair a *partly* deleted job — `--force` is the
+  answer to that.
 - **It cannot see the glTF texture sidecars.** The eight `gltf` jobs get `--gltf_export_materials`,
   which writes each model's textures as PNGs beside the GLB — but the manifest only records CRCs for
   entries matching `-e`, i.e. the models themselves. A patch that retextures an agent without touching
@@ -375,6 +445,9 @@ bun --env-file=.env run publish.ts --upload --prefix data --confirm  # the game-
 bun --env-file=.env run publish.ts --upload --since --confirm        # the delta since the last publish
 ```
 
+After a CS2 patch you usually want the export and this delta together, which is `--sync` — see
+*Updating after a CS2 patch* above. It ends in exactly the second command here, plus `--verify`.
+
 **Publish `data/` BEFORE deploying code that depends on it.** Anything reading those seven lists off
 the CDN — an API, a viewer — will not fail loudly against a CDN still serving last month's
 `skins.json`: a missing key reads `undefined` rather than throwing. The same is true in reverse for
@@ -484,7 +557,7 @@ at 800 characters. Attach it to a bug report.
 | `skipping the update check (not a terminal…)` | stdout/stdin is a pipe, cron or CI. Deliberate: a runner's ref must not move underneath it | `--update` if a scheduled job really does want the latest |
 | `no commits yet — nothing to update from` | a `git init` with no commit, or no upstream configured | `git push -u origin main` once; until then the check is a no-op |
 | `run.bat` flashes and vanishes | it only pauses on failure; on success there is nothing to read | run it from a console, or check the exit code. `--no-pause` disables the pause entirely |
-| `run.bat`: `Elevation was declined, so nothing ran` | the UAC prompt was answered No | `run.bat --no-admin` — only `--incremental` actually needs admin |
+| `run.bat`: `Elevation was declined, so nothing ran` | the UAC prompt was answered No | `run.bat --no-admin` — only the CRC cache (`--incremental`, `--sync`) needs admin, and `--sync` falls back rather than failing |
 
 ---
 
@@ -617,8 +690,8 @@ that is the whole of the verification.
 
 | | |
 |---|---|
-| **why admin** | only `--incremental`: the decompiler writes its `--vpk_cache` manifest as `<archive>.manifest.txt` **beside the VPK it read**, i.e. inside the CS2 install, and `C:\Program Files (x86)` is not user-writable. The path is hardcoded in the decompiler — there is no flag to move it |
-| **when it isn't needed** | everything else. `--discover`, `--list`, `--manifest-only`, `--sample` and a full export write only into this folder. CS2 on another drive (`D:\SteamLibrary`) needs no admin even for `--incremental`. Hence **`run.bat --no-admin`**, because a tool that demands elevation it does not need trains people to click through UAC without reading |
+| **why admin** | only the CRC cache — `--incremental` and `--sync`: the decompiler writes its `--vpk_cache` manifest as `<archive>.manifest.txt` **beside the VPK it read**, i.e. inside the CS2 install, and `C:\Program Files (x86)` is not user-writable. The path is hardcoded in the decompiler — there is no flag to move it. `--sync` is the flag most people will type, so this is the difference between an update taking minutes and taking hours |
+| **when it isn't needed** | everything else. `--discover`, `--list`, `--manifest-only`, `--sample` and a full export write only into this folder. CS2 on another drive (`D:\SteamLibrary`) needs no admin even for `--incremental` or `--sync`, and unelevated `--sync` degrades to a full extraction rather than refusing. Hence **`run.bat --no-admin`**, because a tool that demands elevation it does not need trains people to click through UAC without reading |
 | **elevation probe** | `fltmc`, which requires admin and has no side effects. `net session` is the older trick and gives a false negative when the Server service is stopped |
 | **arguments** | **no user argument ever goes on the relaunch command line.** batch → PowerShell → `cmd` each eat a different set of quotes, and `--cs2 "C:\Program Files (x86)\…"` is precisely the input that breaks the usual `-ArgumentList '%*'` one-liner. They are written to a gitignored sibling file that the elevated copy — which has to `cd` to `%~dp0` regardless — reads back. Only the literal `__elevated` and a numeric tag cross UAC |
 | **loop breaker** | that same `__elevated` sentinel. The elevated copy jumps past the elevation check entirely, so even a wrong answer from the probe can prompt at most once |

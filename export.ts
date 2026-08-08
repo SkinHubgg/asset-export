@@ -12,6 +12,7 @@
  *   bun run export.ts --yes                     # full export, no prompt (wipes the output folder)
  *   bun run export.ts --only models,weapontex   # one stage at a time
  *   bun run export.ts --incremental             # skip files whose source bytes have not changed
+ *   bun run export.ts --sync                    # THE UPDATE: incremental + game data + delta publish
  *   bun run export.ts --manifest-only           # rebuild manifest.json from an existing out/
  *   bun run export.ts --list                    # every VPK the install exposes
  *   bun run export.ts --dump-shaders            # real GLSL via SPIRV-Cross
@@ -29,7 +30,15 @@
  * paths — `out/` is safe — and skips silently when there is nothing to update from, in CI, on a
  * non-TTY, or under `--no-update` / `CS2_EXPORT_NO_UPDATE`. A failed fetch warns and continues.
  *
- * A CS2 update is one command — export, upload only what changed, then prove the CDN serves it:
+ * A CS2 UPDATE IS ONE FLAG — `--sync`, and it is the answer to "the game patched, now what". It
+ * re-extracts only the entries whose source bytes changed (`--incremental`, which never wipes),
+ * regenerates the seven game-data lists, publishes ONLY the delta, and says plainly when there was
+ * nothing to do instead of leaving a wall of skipped-job lines to be added up:
+ *
+ *   bun --env-file=<your .env> run export.ts --sync            # dry run — nothing leaves this machine
+ *   bun --env-file=<your .env> run export.ts --sync --confirm  # publishes the delta, then verifies
+ *
+ * The longhand it composes still works unchanged:
  *
  *   bun --env-file=<your .env> run export.ts --publish --verify            # dry run
  *   bun --env-file=<your .env> run export.ts --publish --confirm --verify  # publishes
@@ -71,6 +80,7 @@ import {
 } from './platform'
 import { currentLog, installCrashHandlers, openRunLog, reportFatal, teeConsole } from './runlog'
 import { runSelfUpdate } from './selfupdate'
+import { type SyncReport, syncSummaryLines, writeSyncReport } from './sync'
 
 // ---------------------------------------------------------------------------------------------
 // The run log — FIRST, before anything that can fail
@@ -113,6 +123,19 @@ const value = (name: string, env?: string) => {
 
 const HERE = import.meta.dir
 const SAMPLE = flag('sample')
+
+/**
+ * `--sync` — the post-patch update. Not a fifth mode so much as three existing ones wired together:
+ * it implies `--incremental` (so nothing is wiped and only changed entries are re-extracted) and it
+ * implies the publish handoff with `--since` (so only the delta is uploaded, and only with
+ * `--confirm`). It exists because the four-command version had to be remembered in the right order.
+ *
+ * NOT NAMED `--update`. That flag is taken — it forces the self-update check in CI, opposite
+ * `--no-update` / `CS2_EXPORT_NO_UPDATE`, and both are subtracted from `shouldPrompt`'s "any
+ * argument" test. Two flags a keystroke apart meaning "update the exporter" and "update the assets"
+ * is a trap; `--sync` collides with nothing in any of the three scripts.
+ */
+const SYNC = flag('sync')
 const TOOLS = resolve(value('tools', 'CS2_EXPORT_TOOLS') ?? join(HERE, '.tools'))
 const OUT = resolve(value('out', 'CS2_EXPORT_OUT') ?? join(HERE, SAMPLE ? 'out-sample' : 'out'))
 const VRF_SRC = join(TOOLS, 'vrf-src')
@@ -2468,31 +2491,60 @@ const dumpShaderSource = async (cli: string, gameDir: string) => {
  */
 const incrementalSafe = (job: Job) => !job.gltf
 
-/** Say what `--incremental` decided, before it decides it. A silent cache is an untrustworthy one. */
-const reportIncremental = (jobs: Job[], game: string) => {
+/**
+ * Can the decompiler write `<archive>.manifest.txt` where it insists on writing it — inside the CS2
+ * install? Probed by actually writing, because that is the only question `access()` cannot answer on
+ * Windows, and probed UP FRONT so the answer arrives in the first second rather than mid-export.
+ */
+const cacheManifestWritable = (csgo: string) => {
+	try {
+		const probe = join(csgo, `.cs2-export-write-probe-${process.pid}`)
+		writeFileSync(probe, '')
+		rmSync(probe)
+		return true
+	} catch {
+		return false
+	}
+}
+
+/**
+ * Say what `--incremental` decided, before it decides it. A silent cache is an untrustworthy one.
+ *
+ * Returns whether the CRC cache is actually usable. THE TWO CALLERS DIFFER ON PURPOSE:
+ * `--incremental` was asked for explicitly, so an unwritable install is a refusal — running a silent
+ * full export in its place would answer a different question than the one that was asked. `--sync`
+ * asks for "make the CDN current", which a full extraction still satisfies, so it is told loudly
+ * what it is about to do and continues. What neither may do is a quiet fallback.
+ */
+const reportIncremental = (jobs: Job[], game: string, degrade: boolean) => {
 	step('Incremental mode')
 	const unsafe = jobs.filter(j => !incrementalSafe(j))
 	ok(`${jobs.length - unsafe.length} of ${jobs.length} job(s) will skip entries whose source CRC is unchanged`)
 	if (unsafe.length)
 		warn(`always re-run in full (glTF texture sidecars are not CRC-tracked): ${unsafe.map(j => j.name).join(', ')}`)
 	ok('the output folder is NOT wiped; pass --force to ignore the cache and re-export everything')
-	// The manifest lives beside the archive, in the game install. Fail here rather than mid-export.
+	// The manifest lives beside the archive, in the game install. Decide here rather than mid-export.
 	const csgo = join(game, 'csgo')
-	try {
-		const probe = join(csgo, `.cs2-export-write-probe-${process.pid}`)
-		writeFileSync(probe, '')
-		rmSync(probe)
-	} catch {
-		throw new UserError(
-			[
-				`--incremental needs to write "<archive>.manifest.txt" beside each VPK, and ${csgo} is not writable.`,
-				"That path is the decompiler's, not ours — there is no flag to move it.",
-				'',
-				'Either run with the privileges to write into the CS2 install, or drop --incremental.',
-			].join('\n'),
-		)
+	if (!cacheManifestWritable(csgo)) {
+		const why = [
+			`The CRC cache needs to write "<archive>.manifest.txt" beside each VPK, and ${csgo} is not writable.`,
+			"That path is the decompiler's, not ours — there is no flag to move it.",
+		]
+		if (!degrade)
+			throw new UserError(
+				[...why, '', 'Either run with the privileges to write into the CS2 install, or drop --incremental.'].join(
+					'\n',
+				),
+			)
+		for (const line of why) warn(line)
+		warn('SO THIS RUN WILL BE A FULL EXTRACTION of every job — slow, and it can tell you nothing about')
+		warn('what the patch changed. On Windows, run.bat elevates for exactly this; elsewhere, run as a')
+		warn('user who can write into the install. The output folder is still not wiped, and the publish')
+		warn('step still uploads only the delta.')
+		return false
 	}
 	ok(`cache manifests are written into ${csgo} (Steam's "verify integrity" will delete them; harmless)`)
+	return true
 }
 
 const main = async () => {
@@ -2545,6 +2597,15 @@ const main = async () => {
 		process.exit(code)
 	}
 
+	/**
+	 * `--sync`'s PREFLIGHT, and it is here — above the install lookup, the toolchain build and every
+	 * byte of extraction — for one reason: `--sync` ends in a publish, `resolveOrigin` throws when
+	 * `SKINS_CDN_ORIGIN` is unset, and discovering that after twenty minutes of extracting is a
+	 * failure the operator pays for twice. Resolving it costs nothing and is pure, so the mode that
+	 * cannot finish without an origin refuses in the first second instead.
+	 */
+	if (SYNC) (await import('./publish')).resolveOrigin()
+
 	const game = findCs2()
 	step('Locating CS2')
 	ok(game)
@@ -2570,17 +2631,59 @@ const main = async () => {
 	// --manifest-only reuses whatever is on disk, so it must work on a machine with no toolchain.
 	const cli = manifestOnly && !cliUsable(CLI) ? null : await ensureCli()
 
+	/**
+	 * What `--sync` will report at the end, filled in as the run goes.
+	 *
+	 * Accumulated rather than recomputed, because both halves of the answer are only observable while
+	 * they happen: the per-entry skip/write counts exist solely in the decompiler's stdout for one
+	 * job at a time, and the delta size exists solely in `upload()`'s return. Nothing on disk
+	 * afterwards can be asked either question. See `sync.ts` for what the numbers are and are not
+	 * allowed to be turned into.
+	 */
+	const sync: SyncReport = {
+		cache: 'off',
+		jobs: { cached: 0, full: 0, uncached: 0 },
+		entries: { written: 0, skipped: 0 },
+		gameData: 'skipped',
+		publish: null,
+	}
+
 	// `cli` is only ever null under --manifest-only, which skips extraction entirely.
 	if (cli && !manifestOnly) {
-		const incremental = flag('incremental') && !flag('force')
-		if (incremental) reportIncremental(jobs, game)
+		// `wanted` and `usable` are separate because they can disagree, and only under --sync: the
+		// cache manifest lives inside the CS2 install, so an unelevated Program Files run cannot have
+		// it. WANTED is what decides the wipe (a sync must never wipe, cache or no cache); USABLE is
+		// what decides whether `--vpk_cache` is passed and, downstream, whether the summary is entitled
+		// to say anything at all about what the patch changed.
+		const wantsIncremental = (flag('incremental') || SYNC) && !flag('force')
+		const useCache = wantsIncremental && reportIncremental(jobs, game, SYNC)
 		// A staged (--only) run must not delete the other stages' output; a full run replaces it.
-		// --incremental never wipes: wiping is the opposite of the thing it is for.
-		if (!only && !incremental && existsSync(OUT)) {
+		// --incremental never wipes: wiping is the opposite of the thing it is for. NEITHER DOES
+		// --sync, and `!SYNC` is here rather than implied by `wantsIncremental` for one combination:
+		// `--sync --force` turns the cache off, and without this it would fall through to the wipe —
+		// so a flag meaning "ignore the cache" would silently also mean "delete 56 GB". Under --sync,
+		// --force re-extracts over the top instead.
+		if (!only && !wantsIncremental && !SYNC && existsSync(OUT)) {
 			step(`Clearing ${OUT}`)
 			rmSync(OUT, { recursive: true, force: true })
 		}
-		step(`Exporting ${jobs.length} job(s)${SAMPLE ? ' (sample)' : ''}${incremental ? ' (incremental)' : ''}`)
+		sync.cache = wantsIncremental ? (useCache ? 'used' : 'unwritable') : 'off'
+		/**
+		 * Which archives already had a cache manifest WHEN THIS RUN STARTED — snapshotted here, above
+		 * the loop, rather than asked per job.
+		 *
+		 * Asked inside the loop it answers a different question every iteration, because the first
+		 * cached job CREATES the file: measured on a three-job run from cold, job one saw no manifest
+		 * and populated it, and jobs two and three then saw one and were excluded by the empty-output
+		 * guard below — so a cold start still took two full passes to warm up, which is the exact cost
+		 * that guard's escape hatch exists to avoid. One snapshot, one answer, one pass.
+		 */
+		const hadManifest = new Map<string, boolean>()
+		for (const job of jobs) {
+			const archive = archiveFor(job)
+			if (!hadManifest.has(archive)) hadManifest.set(archive, existsSync(`${archive}.manifest.txt`))
+		}
+		step(`Exporting ${jobs.length} job(s)${SAMPLE ? ' (sample)' : ''}${useCache ? ' (incremental)' : ''}`)
 		let totalSkipped = 0
 		for (const job of jobs) {
 			// Carried into any failure that happens below, so a crash names the job it happened in
@@ -2593,8 +2696,39 @@ const main = async () => {
 			}
 			const target = join(OUT, job.dir)
 			mkdirSync(target, { recursive: true })
+			/**
+			 * THE CACHE IS ABOUT THE GAME, AND IT HAS NEVER HEARD OF THE OUTPUT FOLDER — so a job with no
+			 * output must not be allowed to skip, however unchanged the game is.
+			 *
+			 * The manifest lives beside the VPK, INSIDE the CS2 install: it survives deleting `out/`,
+			 * pointing `--out` somewhere new, a second checkout, and a colleague's build folder. Every one
+			 * of those then produces an export that is entirely empty and entirely silent — measured on
+			 * 2026-08-08, not imagined: an `--only compmatdata,scripts,localization` run that had
+			 * succeeded once was re-run against a freshly deleted output folder and extracted NOTHING,
+			 * because all three jobs' entries were already recorded as unchanged. The failure surfaced
+			 * three steps later as "items_game.txt is missing", naming a job that had just been asked for
+			 * and had reported success.
+			 *
+			 * So the cache applies only where there is already something for it to be a cache OF. That
+			 * also makes "some files went missing" — the case this whole mode was asked for — do the
+			 * right thing at job granularity, and makes a first-ever run in a new folder correctly
+			 * complete instead of correctly empty. It cannot repair a PARTIALLY deleted job, and the
+			 * summary does not claim it can: `--force` is the answer to that, and it is named in the
+			 * incremental report.
+			 *
+			 * `|| noManifestYet` IS WHAT KEEPS THE GUARD FROM COSTING A WHOLE EXTRA EXPORT, and it was
+			 * added after measuring the version without it. A manifest that does not exist cannot cause
+			 * a wrong skip — there is nothing in it to skip against — but refusing the cache there also
+			 * refuses to WRITE it, so a first-ever `--sync` extracted everything and recorded nothing,
+			 * the second one extracted everything again (this time recording it), and only the third was
+			 * fast. Passing the flag when there is no manifest costs nothing and collapses that to one.
+			 * It reads the snapshot taken above the loop, not the filesystem — see `hadManifest`.
+			 */
+			const hadOutput = countFiles(target) > 0
+			const noManifestYet = !hadManifest.get(archiveFor(job))
+			const cached = useCache && incrementalSafe(job) && (hadOutput || noManifestYet)
 			const cmd = [cli, '-i', archiveFor(job), '-o', target, '-e', job.ext, '-f', filter, '--threads', THREADS]
-			if (incremental && incrementalSafe(job)) cmd.push('--vpk_cache')
+			if (cached) cmd.push('--vpk_cache')
 			if (job.decompile !== false) cmd.push('-d')
 			if (job.gltf) cmd.push('--gltf_export_format', 'glb', '--gltf_export_materials')
 			// BOTH flags. `--gltf_animation_list` alone is inert — it only narrows what
@@ -2608,16 +2742,35 @@ const main = async () => {
 			// last run — so the only visible evidence that the cache did anything is the decompiler's
 			// own per-entry `Skipped (unchanged)` line. Counted and reported, because a cache nobody can
 			// see is a cache nobody should trust.
-			const skipped = incremental ? (r.out.match(/Skipped \(unchanged\)/g)?.length ?? 0) : 0
+			//
+			// `Dump written to` IS THE OTHER HALF, and it is what lets `--sync` state that a patch changed
+			// nothing rather than merely that a lot was skipped. Verified against the real decompiler on
+			// four job shapes — decompiled `.vcompmat_c` and `.vdata_c`, raw `.vtex_c` and raw `.txt` —
+			// cold then warm: every shape prints one line per entry written, and zero of them on a warm
+			// run. Counted only for cached jobs, since for the rest it would just be "all of them".
+			const skipped = cached ? (r.out.match(/Skipped \(unchanged\)/g)?.length ?? 0) : 0
+			const written = cached ? (r.out.match(/Dump written to/g)?.length ?? 0) : 0
 			ok(
 				`${job.name.padEnd(18)} ${String(files).padStart(6)} files   ${((Date.now() - t0) / 1000).toFixed(1)}s` +
-					`${skipped ? `   ${skipped} unchanged, skipped` : ''}${r.code ? `  (exit ${r.code})` : ''}`,
+					`${skipped ? `   ${skipped} unchanged, skipped` : ''}` +
+					`${useCache && !cached && incrementalSafe(job) ? '   no prior output — cache not used' : ''}` +
+					`${r.code ? `  (exit ${r.code})` : ''}`,
 			)
 			totalSkipped += skipped
+			sync.entries.skipped += skipped
+			sync.entries.written += written
+			// A THREE-WAY PARTITION OF EVERY JOB THAT RAN, not two buckets and a leftover. `cached + full
+			// + uncached` is what the summary calls "all N jobs", so a job falling through all three
+			// would make that sentence quietly wrong — and it did, in the state where being wrong matters
+			// most: with the cache unwritable, `useCache` is false, so the 32 non-glTF jobs landed in no
+			// bucket at all and "ALL 40 jobs in full" would have read "ALL 8 jobs in full".
+			if (cached) sync.jobs.cached++
+			else if (!incrementalSafe(job)) sync.jobs.full++
+			else sync.jobs.uncached++
 			if (!files) warn(`${job.name} produced nothing - re-run with --discover to check its path.`)
 		}
 		currentLog().context({ job: undefined, archive: undefined })
-		if (incremental)
+		if (useCache)
 			ok(
 				totalSkipped
 					? `incremental: ${totalSkipped} source entr${totalSkipped === 1 ? 'y was' : 'ies were'} unchanged and not re-extracted`
@@ -2650,33 +2803,83 @@ const main = async () => {
 	 */
 	if (shouldGenerateGameData(OUT)) {
 		step('Generating game data')
-		const { generateGameData, writeGameData } = await import('./generate-gamedata')
-		const data = generateGameData({ out: OUT, iconOrigin: value('icon-origin', 'SKINS_CDN_ORIGIN') })
-		for (const line of writeGameData(OUT, data)) ok(line)
-		if (data.problems.length) {
-			warn(`${data.problems.length} problem(s) in the generated data — the game data changed under us:`)
-			for (const problem of data.problems) warn(`  ${problem}`)
-			warn('run `bun run generate-gamedata.ts --compare` for the detail')
+		/**
+		 * IT MUST NOT TAKE THE EXPORT DOWN WITH IT, which the comment above has claimed since this step
+		 * was added and the code did not do. `generateGameData` THROWS on a tree it cannot read —
+		 * `ENOENT … scandir 'skinicons/panorama/images/econ/default_generated'` is one line of
+		 * `buildSkins`, reproduced here on 2026-08-08 — and being the last step of `main` it took
+		 * everything after it down too: the publish handoff, the summary, and on a full run the
+		 * knowledge that fifty-six gigabytes had extracted perfectly well.
+		 *
+		 * `shouldGenerateGameData` only tests for `items_game.txt`, so it cannot promise the rest of the
+		 * tree; widening it to enumerate every input the generator will ever read would be a second copy
+		 * of the generator's own requirements, drifting from the first. Catching is the honest shape:
+		 * the extraction succeeded and is worth keeping, the lists did not and that is worth shouting.
+		 *
+		 * Loud, because the resulting state is the dangerous one — `data/*.json` older than the assets
+		 * beside it. It is carried into the `--sync` summary and into the menu for the same reason.
+		 */
+		try {
+			const { generateGameData, writeGameData } = await import('./generate-gamedata')
+			const data = generateGameData({ out: OUT, iconOrigin: value('icon-origin', 'SKINS_CDN_ORIGIN') })
+			for (const line of writeGameData(OUT, data)) ok(line)
+			sync.gameData = 'regenerated'
+			if (data.problems.length) {
+				warn(`${data.problems.length} problem(s) in the generated data — the game data changed under us:`)
+				for (const problem of data.problems) warn(`  ${problem}`)
+				warn('run `bun run generate-gamedata.ts --compare` for the detail')
+			}
+		} catch (err) {
+			sync.gameData = 'failed'
+			warn(`the seven data/*.json lists could NOT be regenerated: ${err instanceof Error ? err.message : err}`)
+			warn('data/ is now OLDER than the assets beside it. Everything extracted above is still good,')
+			warn('but publishing this build ships new assets against last export\'s lists.')
+			warn('Run `bun run generate-gamedata.ts --dry-run` to see the failure on its own.')
 		}
-	} else ok('game data skipped — items_game.txt is not in this export (run the `scripts` job)')
+	} else {
+		sync.gameData = 'skipped'
+		ok('game data skipped — items_game.txt is not in this export (run the `scripts` job)')
+	}
 
 	step('Done')
 	ok(`output: ${OUT}`)
-	if (!flag('publish')) ok('Publish with: bun run publish.ts --upload --since --confirm --verify')
-	await publishAndVerify()
+	if (!flag('publish') && !SYNC) ok('Publish with: bun run publish.ts --upload --since --confirm --verify')
+	const outcome = await publishAndVerify()
+	sync.publish = outcome.publish
+
+	/**
+	 * THE SUMMARY, and it comes BEFORE the verify-failure exit rather than after it.
+	 *
+	 * A failed verification is exactly the run whose numbers someone needs, and the old arrangement —
+	 * `process.exit(1)` inside the publish handoff — would have taken them with it. Everything the
+	 * summary needs is already in hand by this line, so printing it costs nothing and the exit code
+	 * is unchanged.
+	 */
+	if (SYNC) {
+		step('Update summary')
+		for (const line of syncSummaryLines(sync)) (line ? ok : console.log)(line)
+		// Only when the menu asked for one, via CS2_EXPORT_SYNC_REPORT. See sync.ts.
+		writeSyncReport(sync)
+	}
+	if (outcome.verifyFailed) process.exit(1)
 }
 
 /**
- * --publish / --verify hand off to publish.ts, so a CS2 update is one command: export, upload
- * only what changed, then prove the origin actually serves it. Uploading stays a dry run unless
- * --confirm is passed, here as well.
+ * --publish / --verify / --sync hand off to publish.ts, so a CS2 update is one command: export,
+ * upload only what changed, then prove the origin actually serves it. Uploading stays a dry run
+ * unless --confirm is passed, here as well.
+ *
+ * RETURNS RATHER THAN EXITS, so `main` can print the update summary before a failed `--verify`
+ * takes the process down. The numbers are hardest to reconstruct on exactly the runs that fail.
  */
-const publishAndVerify = async () => {
-	if (!flag('publish') && !flag('verify')) return
+const publishAndVerify = async (): Promise<{ publish: SyncReport['publish']; verifyFailed: boolean }> => {
+	const wantsPublish = flag('publish') || SYNC
+	if (!wantsPublish && !flag('verify')) return { publish: null, verifyFailed: false }
 	const { upload, verify, resolveOrigin } = await import('./publish')
 	const origin = resolveOrigin()
-	if (flag('publish'))
-		await upload({
+	let published: SyncReport['publish'] = null
+	if (wantsPublish) {
+		const result = await upload({
 			out: OUT,
 			origin,
 			confirm: flag('confirm'),
@@ -2686,10 +2889,26 @@ const publishAndVerify = async () => {
 				.map(p => p.trim())
 				.filter(Boolean),
 		})
-	if (flag('verify')) {
-		const failures = await verify({ out: OUT, origin, quick: flag('quick'), deep: flag('deep') })
-		if (failures.length) process.exit(1)
+		published = {
+			pending: result.pending,
+			uploaded: result.uploaded,
+			bytes: result.bytes,
+			delta: result.delta,
+			dryRun: result.dryRun,
+		}
 	}
+	/**
+	 * `--sync` verifies WHAT IT PUBLISHED, and only then. Proving the origin serves the delta is the
+	 * point of the exercise; running a sampled audit of the whole CDN after a run that uploaded
+	 * nothing would spend minutes answering a question nobody asked, and would turn "there was
+	 * nothing to do" into a non-zero exit for an unrelated reason. `--verify` on its own is still
+	 * always honoured — that is the way to ask the origin directly.
+	 */
+	if (flag('verify') || (SYNC && published && published.uploaded > 0)) {
+		const failures = await verify({ out: OUT, origin, quick: flag('quick'), deep: flag('deep') })
+		return { publish: published, verifyFailed: failures.length > 0 }
+	}
+	return { publish: published, verifyFailed: false }
 }
 
 /**

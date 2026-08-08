@@ -28,7 +28,16 @@
 import { describe, expect, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { JOB_GROUPS, PRESETS, type Plan, commandFor, uploadConfirmPlan, uploadDryPlan } from './interactive'
+import {
+	JOB_GROUPS,
+	PRESETS,
+	type Plan,
+	commandFor,
+	syncExportPlan,
+	syncUploadConfirmPlan,
+	uploadConfirmPlan,
+	uploadDryPlan,
+} from './interactive'
 import { R2_ENV, credentialReport, interactiveNeedsTty, shouldPrompt } from './platform'
 
 /**
@@ -70,6 +79,8 @@ describe('shouldPrompt — the picker must never block automation', () => {
 			['--publish', '--verify'],
 			['--out', '/tmp/x'],
 			['--incremental'],
+			['--sync'],
+			['--sync', '--confirm'],
 		])
 			expect({ argv, prompts: shouldPrompt(argv, true) }).toEqual({ argv, prompts: false })
 	})
@@ -150,14 +161,33 @@ describe('presets map to real flags', () => {
 	})
 
 	/**
-	 * Only the publish half asks for `.env`, and only the publish half needs it. Marking an export
-	 * plan `needsEnv` would put a `--env-file` into a printed command that has nothing to do with
-	 * credentials, which is the kind of noise that teaches people to ignore the printed command.
+	 * A plan asks for `.env` exactly when it will read a credential or an origin, and no sooner.
+	 * Marking an ordinary export plan `needsEnv` would put a `--env-file` into a printed command that
+	 * has nothing to do with credentials, which is the kind of noise that teaches people to ignore the
+	 * printed command.
+	 *
+	 * `--sync` IS THE ONE EXPORT PLAN THAT NEEDS IT, and that is why it is not a `PRESETS` entry: it
+	 * ends in a delta publish, so it resolves the CDN origin before it extracts anything. Asserted
+	 * here beside the rule rather than left as an unstated exception.
 	 */
-	test('exactly the publish plans want the .env, and no export or game-data plan does', () => {
+	test('a plan wants the .env exactly when it publishes — which includes the update', () => {
 		for (const [name, plan] of Object.entries(PRESETS))
 			expect({ [name]: Boolean(plan.needsEnv) }).toEqual({ [name]: plan.script === 'publish' })
 		expect(uploadDryPlan([]).needsEnv).toBe(true)
+		expect(syncExportPlan()).toMatchObject({ script: 'export', argv: ['--sync'], needsEnv: true })
+	})
+
+	/**
+	 * `--update` IS ALREADY TAKEN, by the self-updater, and `--no-update` is its pair. Two flags a
+	 * keystroke apart meaning "update the exporter" and "update the assets" is a trap worth a test:
+	 * this fails if anyone ever renames the update mode onto that word.
+	 */
+	test('the update mode does not collide with the self-updater\'s flags', () => {
+		expect(syncExportPlan().argv).not.toContain('--update')
+		expect(syncExportPlan().argv).not.toContain('--no-update')
+		expect(readFileSync(join(import.meta.dir, 'platform.ts'), 'utf8')).toContain(
+			"UPDATE_FLAGS = ['--update', '--no-update']",
+		)
 	})
 })
 
@@ -190,6 +220,8 @@ describe('every flag the menu emits is read by the script it is sent to', () => 
 			...Object.entries(PRESETS),
 			['upload-dry', uploadDryPlan(['data'])],
 			['upload-confirm', uploadConfirmPlan(0, ['data']) as Plan],
+			['sync', syncExportPlan()],
+			['sync-upload', syncUploadConfirmPlan(0) as Plan],
 		]
 		for (const [name, plan] of plans) {
 			const src = sourceOf(plan.script)
@@ -252,6 +284,39 @@ describe('the upload confirm step is unreachable without a successful dry run', 
 		}
 	})
 
+	/**
+	 * THE UPDATE'S CONFIRM IS THE SAME MECHANISM, not a second convention that happens to agree.
+	 *
+	 * "Update after a CS2 patch" is the option most people will reach for most often, which is exactly
+	 * why its convenience must not buy anything at the upload's expense: the step that writes is still
+	 * derived from the exit code of the step that did not, so a failed update makes it unreachable
+	 * rather than merely ill-advised.
+	 */
+	test('the update offers no upload at all when the update step failed', () => {
+		expect(syncUploadConfirmPlan(1)).toBeNull()
+		expect(syncUploadConfirmPlan(2)).toBeNull()
+		// 130 is Ctrl-C. Cancelling the update is not a shortcut to the upload either.
+		expect(syncUploadConfirmPlan(130)).toBeNull()
+	})
+
+	test('the update step itself can never write — it is a dry run by construction', () => {
+		const plan = syncExportPlan()
+		expect(plan.argv).toEqual(['--sync'])
+		expect(plan.argv).not.toContain('--confirm')
+		expect(Boolean(plan.writes)).toBe(false)
+	})
+
+	test('the update upload is the delta, confirmed, and verified afterwards', () => {
+		const real = syncUploadConfirmPlan(0) as Plan
+		expect(real.script).toBe('publish')
+		expect(real.argv).toEqual(['--upload', '--since', '--confirm', '--verify'])
+		expect(real.writes).toBe(true)
+		// --since is what keeps a routine post-patch update from re-sending 51 GB, and --verify is what
+		// makes "published" mean the origin serves it rather than a PUT returning 200.
+		expect(real.argv).toContain('--since')
+		expect(real.argv).toContain('--verify')
+	})
+
 	test('an empty prefix list means "everything" and emits no --prefix, rather than an empty one', () => {
 		// `--prefix ''` would reach publish.ts's `value()` and match nothing, so a whole-build upload
 		// would silently become a no-op — the opposite failure from the one being guarded against.
@@ -279,6 +344,17 @@ describe('the package.json entry point cannot become a destructive one', () => {
 		// The property that makes it safe: no terminal, no run — and no export either.
 		expect(shouldPrompt(['--interactive'], false)).toBe(false)
 		expect(interactiveNeedsTty(['--interactive'], false)).toBe(true)
+	})
+
+	/**
+	 * `sync` is safe as a bare script in a way `export` is not: it carries a flag, so `shouldPrompt`
+	 * sees an argument and never prompts, and `--sync` never wipes. Bun auto-loads `.env` from the
+	 * working directory, which is how the origin reaches it without an `--env-file` in the script.
+	 */
+	test('`sync` is the scripted update, and it is a flag rather than the bare command', () => {
+		expect(scripts.sync).toBe('bun run export.ts --sync')
+		expect(shouldPrompt(['--sync'], true)).toBe(false)
+		expect(shouldPrompt(['--sync'], false)).toBe(false)
 	})
 
 	test('the five original scripts are untouched — the flag interface is the contract', () => {
