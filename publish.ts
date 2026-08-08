@@ -630,11 +630,31 @@ const openBucket = async (): Promise<Bucket> => {
 			].join('\n'),
 		)
 
+	/**
+	 * Imported lazily so `--verify` and a dry-run `--upload` never need the SDK — they are the paths
+	 * that must work with no credentials and no setup.
+	 *
+	 * The message used to say "run `bun install`", which was useless advice: the package was not in
+	 * `package.json` at all, so no amount of installing could produce it. Reported from Windows on
+	 * 2026-08-08 by someone who had run exactly that, twice. It is a real dependency now, which is
+	 * also why `tsc` used to report two errors here that were written off as a known floor — they
+	 * were this bug, not noise.
+	 */
 	let sdk: typeof import('@aws-sdk/client-s3')
 	try {
 		sdk = await import('@aws-sdk/client-s3')
-	} catch {
-		throw new UserError('@aws-sdk/client-s3 is not installed. Run `bun install` at the repo root.')
+	} catch (e) {
+		throw new UserError(
+			[
+				'Could not load @aws-sdk/client-s3, which the upload path needs.',
+				'',
+				'It is a declared dependency, so `bun install` in this folder should fix it.',
+				'If that has already been run, the install is incomplete — delete node_modules and',
+				'bun.lock, then `bun install` again.',
+				'',
+				`Underlying error: ${e instanceof Error ? e.message : String(e)}`,
+			].join('\n'),
+		)
 	}
 	const name = process.env.R2_BUCKET_NAME as string
 	// R2_ENDPOINT points the publisher at a different S3 implementation — a MinIO, or the local
