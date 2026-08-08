@@ -11,9 +11,6 @@ out-sample/
 ShaderDump/bin/
 ShaderDump/obj/
 
-# Decompiled shader bytecode. The readable sources beside it (shader-src/*.txt) ARE committed —
-# they are the reference the compositor was transcribed from — but the .vcs blobs are extracted.
-shader-src/*.vcs
 
 # The run logs — one file per invocation, the newest 10 kept, written line by line as the run goes.
 # NOT committed, for the same reason as .env: THE REPO IS PUBLIC, and a log carries absolute paths,
